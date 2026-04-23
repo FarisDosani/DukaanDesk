@@ -242,9 +242,19 @@ select:focus-visible {
 
 .btn-tertiary {
     min-width: 116px;
+    min-height: 45px;
+    border-radius: 12px;
     color: #22465f;
     background: #e8f2fb;
     border: 1px solid #b9d1e3;
+    font-family: 'Sora', sans-serif;
+    font-weight: 700;
+    font-size: 0.95rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
+    padding: 0 16px;
 }
 
 .btn-tertiary:hover:not(:disabled) {
@@ -319,6 +329,60 @@ select:focus-visible {
     margin-bottom: 18px;
 }
 
+.topbar-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.header-nav {
+    display: grid;
+    gap: 8px;
+    min-width: 170px;
+}
+
+.dashboard-topbar {
+    border: 1px solid rgba(15, 51, 80, 0.2);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(247, 252, 255, 0.9));
+}
+
+.dashboard-kpis {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.kpi-card {
+    padding: 16px 18px;
+    border-radius: 16px;
+    border-color: rgba(19, 38, 53, 0.12);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(241, 249, 255, 0.92));
+}
+
+.kpi-label {
+    margin: 0;
+    color: #5b7387;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 700;
+}
+
+.kpi-value {
+    margin: 8px 0 0;
+    color: #133d5d;
+    font-family: 'Sora', sans-serif;
+    font-size: clamp(1.1rem, 1.8vw, 1.5rem);
+    font-weight: 700;
+    letter-spacing: -0.02em;
+}
+
+.flash-stack {
+    padding: 12px 18px;
+    margin-bottom: 16px;
+}
+
 .identity h2 {
     margin: 0;
     font-family: 'Sora', sans-serif;
@@ -354,7 +418,7 @@ select:focus-visible {
     gap: 10px;
 }
 
-.btn-refresh {
+.toolbar-actions .btn-tertiary {
     min-height: 45px;
     display: inline-flex;
     align-items: center;
@@ -371,12 +435,183 @@ select:focus-visible {
     overflow: hidden;
 }
 
+.dashboard-content {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 16px;
+    align-items: start;
+    position: relative;
+}
+
+.summary-sidebar {
+    padding: 14px;
+    max-height: 74vh;
+    overflow: auto;
+}
+
+.dashboard-nav {
+    padding: 14px;
+    display: grid;
+    gap: 8px;
+    align-content: start;
+}
+
+.nav-link {
+    display: block;
+    border: 1px solid #d3e3ef;
+    border-radius: 12px;
+    padding: 10px 12px;
+    color: #224c6a;
+    text-decoration: none;
+    font-weight: 700;
+    background: #f8fcff;
+}
+
+.nav-link:hover {
+    filter: brightness(0.98);
+}
+
+.nav-link.active {
+    background: #e3f1fb;
+    border-color: #b8d7ec;
+    color: #123f5e;
+}
+
+.summary-title {
+    margin: 4px 8px 12px;
+    font-family: 'Sora', sans-serif;
+    font-size: 1.02rem;
+    letter-spacing: -0.01em;
+    color: #173d5a;
+}
+
+.summary-folder,
+.summary-month {
+    border: 1px solid #d7e6f2;
+    border-radius: 12px;
+    background: #f8fcff;
+}
+
+.summary-folder + .summary-folder {
+    margin-top: 10px;
+}
+
+.summary-folder > summary,
+.summary-month > summary {
+    list-style: none;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    padding: 10px 12px;
+    font-weight: 700;
+    color: #1b4768;
+}
+
+.summary-folder > summary::-webkit-details-marker,
+.summary-month > summary::-webkit-details-marker {
+    display: none;
+}
+
+.summary-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 28px;
+    height: 22px;
+    padding: 0 8px;
+    border-radius: 999px;
+    background: #ddeefb;
+    color: #235579;
+    font-size: 0.75rem;
+}
+
+.summary-month-list {
+    padding: 0 10px 10px;
+    display: grid;
+    gap: 8px;
+}
+
+.summary-month {
+    background: #ffffff;
+}
+
+.summary-order-list {
+    margin: 0;
+    padding: 0 10px 10px 20px;
+    display: grid;
+    gap: 6px;
+}
+
+.summary-order-list li {
+    color: #2a4e68;
+    font-size: 0.84rem;
+}
+
+.summary-order-id {
+    font-weight: 700;
+    color: #1a4970;
+}
+
+.summary-order-meta {
+    color: #58778e;
+}
+
+.summary-empty {
+    margin: 0;
+    padding: 0 12px 10px;
+    font-size: 0.82rem;
+    color: #7390a3;
+}
+
+.summary-page-grid {
+    padding: 0 12px 14px;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.summary-page-card {
+    border: 1px solid #d8e8f3;
+    border-radius: 12px;
+    background: #f8fcff;
+    padding: 10px;
+}
+
+.summary-page-card h4 {
+    margin: 2px 2px 10px;
+    font-family: 'Sora', sans-serif;
+    font-size: 0.95rem;
+    color: #1f4d6f;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
 .orders-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 12px;
     padding: 18px 22px 8px;
+}
+
+.dashboard-orders-header {
+    padding-bottom: 12px;
+    border-bottom: 1px solid rgba(19, 38, 53, 0.08);
+    margin-bottom: 8px;
+}
+
+.dashboard-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: #eff6fc;
+}
+
+.dashboard-table td {
+    line-height: 1.35;
 }
 
 .orders-header h3 {
@@ -580,9 +815,35 @@ td {
         padding: 18px;
     }
 
+    .topbar-left {
+        width: 100%;
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .header-nav {
+        width: 100%;
+    }
+
     .toolbar {
         grid-template-columns: 1fr;
         padding: 16px 18px;
+    }
+
+    .dashboard-content {
+        grid-template-columns: 1fr;
+    }
+
+    .summary-sidebar {
+        max-height: none;
+    }
+
+    .summary-page-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .dashboard-kpis {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
     .toolbar-form {
@@ -593,8 +854,7 @@ td {
         width: 100%;
     }
 
-    .toolbar-actions .btn-tertiary,
-    .toolbar-actions .btn-refresh {
+    .toolbar-actions .btn-tertiary {
         flex: 1;
     }
 
@@ -610,6 +870,12 @@ td {
 
     .modal-card {
         padding: 20px;
+    }
+}
+
+@media (max-width: 560px) {
+    .dashboard-kpis {
+        grid-template-columns: 1fr;
     }
 }
 

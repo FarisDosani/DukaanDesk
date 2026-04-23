@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Summary | PakkOrder</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+    <main class="page-shell">
+        <header class="surface topbar dashboard-topbar">
+            <div class="topbar-left">
+                <nav class="header-nav" aria-label="Seller navigation">
+                    <a class="nav-link" href="/dashboard">Current Orders</a>
+                    <a class="nav-link active" href="/summary" aria-current="page">Summary</a>
+                </nav>
+                <div class="identity">
+                    <h2>{{ user.business_name }} | Summary</h2>
+                    <p>Signed in as {{ user.username }}{% if user.domain_name %} | Domain: {{ user.domain_name }}{% endif %}</p>
+                </div>
+            </div>
+            <form method="post" action="/logout">
+                <button class="btn-secondary" type="submit">Logout</button>
+            </form>
+        </header>
+
+        <section class="dashboard-kpis" aria-label="Summary KPIs">
+            <article class="surface kpi-card">
+                <p class="kpi-label">Total Orders</p>
+                <p class="kpi-value">{{ kpis.total }}</p>
+            </article>
+            <article class="surface kpi-card">
+                <p class="kpi-label">Active Pending Orders</p>
+                <p class="kpi-value">{{ kpis.pending }}</p>
+            </article>
+            <article class="surface kpi-card">
+                <p class="kpi-label">Cancelled/Returned Orders</p>
+                <p class="kpi-value">{{ kpis.cancelled_or_returned }}</p>
+            </article>
+            <article class="surface kpi-card">
+                <p class="kpi-label">Total Revenue</p>
+                <p class="kpi-value">Rs. {{ '%.2f' | format(kpis.revenue) }}</p>
+            </article>
+        </section>
+
+        <section class="surface orders" aria-label="Monthly summary folders">
+                <div class="orders-header dashboard-orders-header">
+                    <h3>Summary Folders (Last 12 Months)</h3>
+                    <span class="meta">Data source: {{ source }}</span>
+                </div>
+
+                <div class="summary-page-grid">
+                    {% for section in summary_sections %}
+                        <article class="summary-page-card">
+                            <h4>{{ section.label }} <span class="summary-count">{{ section.total }}</span></h4>
+
+                            {% for month in section.months %}
+                                <details class="summary-month" {% if month.count > 0 and loop.first %}open{% endif %}>
+                                    <summary>
+                                        <span>{{ month.label }}</span>
+                                        <span class="summary-count">{{ month.count }}</span>
+                                    </summary>
+
+                                    {% if month.orders %}
+                                        <ul class="summary-order-list">
+                                            {% for order in month.orders %}
+                                                <li>
+                                                    <span class="summary-order-id">#{{ order.SellerOrderNo or order.OrderID }}</span>
+                                                    <span class="summary-order-meta">{{ order.BuyerName }} | Rs. {{ order.TotalAmount }} | {{ order.OrderDate }}</span>
+                                                </li>
+                                            {% endfor %}
+                                        </ul>
+                                    {% else %}
+                                        <p class="summary-empty">No orders in this month.</p>
+                                    {% endif %}
+                                </details>
+                            {% endfor %}
+                        </article>
+                    {% endfor %}
+                </div>
+        </section>
+    </main>
+</body>
+</html>

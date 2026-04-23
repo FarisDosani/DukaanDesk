@@ -394,7 +394,7 @@ def filter_dashboard_orders(orders: list, raw_search: str) -> list:
     return filtered
 
 
-def fetch_orders_for_dashboard(seller_id: int, search: str):
+def fetch_orders_for_dashboard(seller_id: int, search: str = "", apply_search: bool = True):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -429,10 +429,147 @@ def fetch_orders_for_dashboard(seller_id: int, search: str):
         columns = [desc[0] for desc in cursor.description]
         rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
         conn.close()
-        return filter_dashboard_orders(rows, search), "database"
+        if apply_search:
+            rows = filter_dashboard_orders(rows, search)
+        return rows, "database"
     except Exception:
         scoped = [row for row in FALLBACK_ORDERS if row["OrderID"] == 1 or seller_id == 1]
-        return filter_dashboard_orders(scoped, search), "fallback"
+        if apply_search:
+            scoped = filter_dashboard_orders(scoped, search)
+        return scoped, "fallback"
+
+
+def is_active_dashboard_order(order: dict) -> bool:
+    order_status = str(order.get("OrderStatus", "") or "").strip().lower()
+    delivery_status = str(order.get("DeliveryStatus", "") or "").strip().lower()
+
+    if order_status == "pending":
+        return True
+
+    return order_status == "confirmed" and (not delivery_status or delivery_status == "pending")
+
+
+def get_last_12_months_desc() -> list:
+    now = datetime.now()
+    year = now.year
+    month = now.month
+    months = []
+
+    for _ in range(12):
+        month_start = datetime(year, month, 1)
+        months.append(
+            {
+                "key": f"{year:04d}-{month:02d}",
+                "label": month_start.strftime("%b %Y"),
+            }
+        )
+
+        month -= 1
+        if month == 0:
+            month = 12
+            year -= 1
+
+    return months
+
+
+def parse_order_datetime(value):
+    if isinstance(value, datetime):
+        return value
+
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        return datetime.fromisoformat(text.replace("Z", ""))
+    except ValueError:
+        return None
+
+
+def build_summary_sections(orders: list) -> list:
+    month_defs = get_last_12_months_desc()
+    month_keys = {item["key"] for item in month_defs}
+
+    def init_month_map():
+        return {item["key"]: {"label": item["label"], "orders": []} for item in month_defs}
+
+    section_configs = [
+        {"key": "delivered", "label": "Delivered"},
+        {"key": "cancelled", "label": "Cancelled"},
+        {"key": "returned_by_buyer", "label": "Returned by buyer"},
+    ]
+    section_maps = {section["key"]: init_month_map() for section in section_configs}
+
+    for order in orders:
+        order_date = parse_order_datetime(order.get("OrderDate"))
+        if not order_date:
+            continue
+
+        month_key = f"{order_date.year:04d}-{order_date.month:02d}"
+        if month_key not in month_keys:
+            continue
+
+        order_status = str(order.get("OrderStatus", "") or "").strip().lower()
+        delivery_status = str(order.get("DeliveryStatus", "") or "").strip().lower()
+
+        section_key = None
+        if delivery_status == "delivered":
+            section_key = "delivered"
+        elif order_status == "cancelled":
+            section_key = "cancelled"
+        elif delivery_status == "returned by buyer":
+            section_key = "returned_by_buyer"
+
+        if section_key:
+            section_maps[section_key][month_key]["orders"].append(order)
+
+    sections = []
+    for section in section_configs:
+        months = []
+        section_total = 0
+
+        for month in month_defs:
+            month_orders = section_maps[section["key"]][month["key"]]["orders"]
+            months.append(
+                {
+                    "key": month["key"],
+                    "label": section_maps[section["key"]][month["key"]]["label"],
+                    "count": len(month_orders),
+                    "orders": month_orders,
+                }
+            )
+            section_total += len(month_orders)
+
+        sections.append(
+            {
+                "key": section["key"],
+                "label": section["label"],
+                "total": section_total,
+                "months": months,
+            }
+        )
+
+    return sections
+
+
+def build_dashboard_kpis(all_orders: list, active_orders: list) -> dict:
+    revenue = sum(float(order.get("TotalAmount", 0) or 0) for order in all_orders if str(order.get("DeliveryStatus", "") or "") == "Delivered")
+    cancelled_or_returned = sum(
+        1
+        for order in all_orders
+        if (str(order.get("OrderStatus", "") or "") == "Cancelled")
+        or (str(order.get("DeliveryStatus", "") or "") == "Returned by buyer")
+    )
+    return {
+        "total": len(all_orders),
+        "pending": len(active_orders),
+        "confirmed": sum(1 for order in all_orders if str(order.get("OrderStatus", "") or "") == "Confirmed"),
+        "cancelled_or_returned": cancelled_or_returned,
+        "revenue": revenue,
+    }
 
 
 def place_public_order(payload: dict) -> dict:
@@ -688,8 +825,37 @@ def logout():
 def dashboard():
     user = session["user"]
     search = str(request.args.get("search", "")).strip()
-    orders, source = fetch_orders_for_dashboard(user["seller_id"], search)
-    return render_template("dashboard.html", user=user, orders=orders, search=search, source=source)
+    all_orders, source = fetch_orders_for_dashboard(user["seller_id"], apply_search=False)
+    active_orders = [order for order in all_orders if is_active_dashboard_order(order)]
+    active_orders = filter_dashboard_orders(active_orders, search)
+    kpis = build_dashboard_kpis(all_orders, active_orders)
+
+    return render_template(
+        "dashboard.html",
+        user=user,
+        orders=active_orders,
+        kpis=kpis,
+        search=search,
+        source=source,
+    )
+
+
+@app.get("/summary")
+@require_auth
+def summary_page():
+    user = session["user"]
+    all_orders, source = fetch_orders_for_dashboard(user["seller_id"], apply_search=False)
+    active_orders = [order for order in all_orders if is_active_dashboard_order(order)]
+    summary_sections = build_summary_sections(all_orders)
+    kpis = build_dashboard_kpis(all_orders, active_orders)
+
+    return render_template(
+        "summary.html",
+        user=user,
+        summary_sections=summary_sections,
+        kpis=kpis,
+        source=source,
+    )
 
 
 @app.post("/orders/<int:order_id>/action")
@@ -837,6 +1003,11 @@ def signup_html_redirect():
 @app.get("/dashboard.html")
 def dashboard_html_redirect():
     return redirect(url_for("dashboard"))
+
+
+@app.get("/summary.html")
+def summary_html_redirect():
+    return redirect(url_for("summary_page"))
 
 
 @app.get("/store.html")
