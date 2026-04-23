@@ -1,0 +1,20 @@
+{
+  "name": "dbs_project",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node app.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express-session": "^1.18.1",
+    "express": "^5.2.1",
+    "msnodesqlv8": "^5.1.9",
+    "mssql": "^12.3.1"
+  }
+}

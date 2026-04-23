@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PakkOrder Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <style>
+        .legacy-shell {
+            display: grid;
+            gap: 18px;
+        }
+
+        .legacy-head {
+            padding: 24px;
+        }
+
+        .legacy-head h1 {
+            margin: 0;
+            font-family: 'Sora', sans-serif;
+            font-size: clamp(1.35rem, 2.8vw, 2rem);
+            letter-spacing: -0.02em;
+        }
+
+        .legacy-note {
+            margin: 10px 0 0;
+            color: #667f92;
+            font-weight: 600;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 14px;
+            padding: 18px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid rgba(19, 38, 53, 0.12);
+            border-radius: 14px;
+            padding: 16px;
+            box-shadow: 0 10px 24px rgba(25, 48, 69, 0.12);
+        }
+
+        .card h3 {
+            margin: 0 0 10px;
+            font-family: 'Sora', sans-serif;
+            color: #23435d;
+            font-size: 1.02rem;
+        }
+
+        .card p {
+            margin: 8px 0;
+            color: #3b5870;
+            font-weight: 500;
+        }
+
+        .price {
+            margin-top: 12px;
+            color: #0d5784;
+            font-family: 'Sora', sans-serif;
+            font-weight: 700;
+            font-size: 1.1rem;
+        }
+
+        @media (max-width: 720px) {
+            .grid {
+                grid-template-columns: 1fr;
+                padding: 12px;
+            }
+
+            .legacy-head {
+                padding: 18px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <main class="page-shell legacy-shell">
+        <section class="surface legacy-head">
+            <h1>PakkOrder Portal</h1>
+            <p class="legacy-note">Use the links below to continue without JavaScript.</p>
+        </section>
+
+        <section class="surface">
+            <div class="grid">
+                <div class="card">
+                    <h3>Seller Login</h3>
+                    <p>Access your dashboard and update order states.</p>
+                    <p><a href="/login">Go to login</a></p>
+                </div>
+                <div class="card">
+                    <h3>Create Seller Account</h3>
+                    <p>Register business, WhatsApp number, and client user.</p>
+                    <p><a href="/signup">Go to signup</a></p>
+                </div>
+                <div class="card">
+                    <h3>Buyer Store</h3>
+                    <p>Place a COD order for a seller domain.</p>
+                    <p><a href="/store">Open store form</a></p>
+                </div>
+            </div>
+        </section>
+    </main>
+</body>
+</html>

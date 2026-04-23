@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Dashboard | PakkOrder</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+    <main class="page-shell">
+        <header class="surface topbar">
+            <div class="identity">
+                <h2 id="welcomeTitle">{{ user.business_name }} | Orders Dashboard</h2>
+                <p id="identityLine">Signed in as {{ user.username }}{% if user.domain_name %} | Domain: {{ user.domain_name }}{% endif %}</p>
+            </div>
+            <form method="post" action="/logout">
+                <button id="logoutBtn" class="btn-secondary" type="submit">Logout</button>
+            </form>
+        </header>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <section class="surface" style="padding: 12px 18px; margin-bottom: 16px;">
+                    {% for category, message in messages %}
+                        <div class="message show {{ category }}" role="alert" aria-live="polite">{{ message }}</div>
+                    {% endfor %}
+                </section>
+            {% endif %}
+        {% endwith %}
+
+        <section class="surface toolbar" aria-label="Search orders">
+            <form method="get" action="/dashboard" style="display: contents;">
+                <input id="searchInput" name="search" type="search" value="{{ search }}" placeholder="Search by order ID, buyer ID, buyer name, phone, address, update, action, status, amount, date..." aria-label="Search orders" />
+                <button id="refreshBtn" class="btn-tertiary" type="submit">Search</button>
+            </form>
+        </section>
+
+        <section class="surface orders" aria-label="Orders table">
+            <div class="orders-header">
+                <h3>Order list</h3>
+                <span id="sourceTag" class="meta">Data source: {{ source }}</span>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Order ID</th>
+                            <th>Buyer ID</th>
+                            <th>Buyer</th>
+                            <th>Phone</th>
+                            <th>Date</th>
+                            <th>Amount</th>
+                            <th>Update</th>
+                            <th>Address</th>
+                            <th>Action</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="ordersBody">
+                        {% for order in orders %}
+                            <tr>
+                                <td>#{{ order.SellerOrderNo or order.OrderID or '-' }}</td>
+                                <td>#{{ order.BuyerID or '-' }}</td>
+                                <td>{{ order.BuyerName or '-' }}</td>
+                                <td>{{ order.Phone or '-' }}</td>
+                                <td>{{ order.OrderDate or '-' }}</td>
+                                <td class="amount">Rs. {{ order.TotalAmount }}</td>
+                                <td>{{ order.ActionTaken or '-' }}</td>
+                                <td>{{ order.DeliveryAddress or '-' }}</td>
+                                <td>
+                                    {% if order.OrderStatus == 'Pending' %}
+                                        <form method="post" action="/orders/{{ order.OrderID }}/action">
+                                            <input type="hidden" name="search" value="{{ search }}" />
+                                            <select class="status-select" name="action" required>
+                                                <option value="">Select action</option>
+                                                <option value="confirm">Confirm</option>
+                                                <option value="not_confirm">Not Confirm</option>
+                                            </select>
+                                            <button class="btn-tertiary" type="submit" style="margin-top: 8px; min-height: 34px;">Apply</button>
+                                        </form>
+                                    {% else %}
+                                        <span class="status-chip muted">Action completed</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    {% if order.OrderStatus == 'Confirmed' and (order.DeliveryStatus or 'Pending') == 'Pending' %}
+                                        <form method="post" action="/orders/{{ order.OrderID }}/status">
+                                            <input type="hidden" name="search" value="{{ search }}" />
+                                            <select class="status-select" name="status" required>
+                                                <option value="pending" selected>Pending</option>
+                                                <option value="delivered">Delivered</option>
+                                                <option value="returned_by_buyer">Returned by buyer</option>
+                                            </select>
+                                            <button class="btn-tertiary" type="submit" style="margin-top: 8px; min-height: 34px;">Update</button>
+                                        </form>
+                                    {% elif order.OrderStatus == 'Confirmed' %}
+                                        <span class="status-chip muted">{{ order.DeliveryStatus }}</span>
+                                    {% else %}
+                                        <span class="status-chip muted">-</span>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                <div id="emptyState" class="empty" {% if orders %}hidden{% endif %}>No matching orders found.</div>
+            </div>
+        </section>
+    </main>
+</body>
+</html>

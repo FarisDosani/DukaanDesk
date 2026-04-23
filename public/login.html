@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Client Login | PakkOrder</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+    <main class="page-shell">
+        <section class="surface auth-wrap" aria-label="Client authentication">
+            <aside class="auth-art">
+                <div class="shape a"></div>
+                <div class="shape b"></div>
+                <h1>COD Client Portal</h1>
+                <p>
+                    Securely access your pending confirmations and buyer details.
+                    Accounts are protected with a 3-attempt lock policy.
+                </p>
+            </aside>
+
+            <section class="auth-panel">
+                <h2 class="panel-title">Welcome back</h2>
+                <p class="panel-subtitle">Sign in with your seller email, username, and password.</p>
+
+                <form id="loginForm" method="post" action="/login">
+                    <label for="email">Email</label>
+                    <input id="email" name="email" type="email" autocomplete="email" value="{{ email or '' }}" required />
+
+                    <label for="username">Username</label>
+                    <input id="username" name="username" type="text" autocomplete="username" value="{{ username or '' }}" required />
+
+                    <label for="password">Password</label>
+                    <input id="password" name="password" type="password" autocomplete="current-password" required />
+
+                    <button id="loginBtn" class="btn-primary" type="submit">Sign in</button>
+                    {% with messages = get_flashed_messages(with_categories=true) %}
+                        {% if messages %}
+                            {% for category, message in messages %}
+                                <div class="message show {{ category }}" role="alert" aria-live="polite">{{ message }}</div>
+                            {% endfor %}
+                        {% endif %}
+                    {% endwith %}
+                </form>
+
+                <p class="auth-switch">New client? <a href="/signup">Create your account</a></p>
+
+                <p class="hint">Demo fallback account (when auth table is missing): waqtoro@example.com / waqtoro-admin / admin123</p>
+            </section>
+        </section>
+    </main>
+</body>
+</html>

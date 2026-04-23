@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Client Signup | PakkOrder</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+    <main class="page-shell">
+        <section class="surface auth-wrap" aria-label="Client account signup">
+            <aside class="auth-art">
+                <div class="shape a"></div>
+                <div class="shape b"></div>
+                <h1>Create Client Account</h1>
+                <p>
+                    Register your business and create a dedicated username/password.
+                    Your account is stored in the CODManager database.
+                </p>
+            </aside>
+
+            <section class="auth-panel">
+                <h2 class="panel-title">Sign up</h2>
+                <p class="panel-subtitle">Create your portal login with email, username, and password.</p>
+
+                <form id="signupForm" method="post" action="/signup">
+                    <label for="businessName">Business Name</label>
+                    <input id="businessName" name="businessName" type="text" autocomplete="organization" value="{{ (form.business_name if form else '') }}" required />
+
+                    <label for="whatsappNumber">WhatsApp Number</label>
+                    <input id="whatsappNumber" name="whatsappNumber" type="text" placeholder="+923001112233" value="{{ (form.whatsapp_number if form else '') }}" required />
+                    <p class="field-hint">
+                        Use the same business name and same WhatsApp to create more client logins for one seller.
+                        A WhatsApp already linked to a different business will be rejected.
+                    </p>
+
+                    <label for="email">Email</label>
+                    <input id="email" name="email" type="email" autocomplete="email" placeholder="owner@shop.com" value="{{ (form.email if form else '') }}" required />
+                    <p class="field-hint">
+                        This email must be unique for each seller profile.
+                    </p>
+
+                    <label for="domainName">Domain Name</label>
+                    <input id="domainName" name="domainName" type="text" placeholder="shopname.local" value="{{ (form.domain_name if form else '') }}" required />
+                    <p class="field-hint">
+                        Buyers place orders using this domain. Example local URL: /store/shopname.local
+                    </p>
+
+                    <label for="username">Username</label>
+                    <input id="username" name="username" type="text" autocomplete="username" value="{{ (form.username if form else '') }}" required />
+
+                    <label for="password">Password</label>
+                    <input id="password" name="password" type="password" autocomplete="new-password" required />
+
+                    <label for="confirmPassword">Confirm Password</label>
+                    <input id="confirmPassword" name="confirmPassword" type="password" autocomplete="new-password" required />
+
+                    <button id="signupBtn" class="btn-primary" type="submit">Create account</button>
+                    {% with messages = get_flashed_messages(with_categories=true) %}
+                        {% if messages %}
+                            {% for category, message in messages %}
+                                <div class="message show {{ category }}" role="alert" aria-live="polite">{{ message }}</div>
+                            {% endfor %}
+                        {% endif %}
+                    {% endwith %}
+                </form>
+
+                <p class="auth-switch">Already have an account? <a href="/login">Go to login</a></p>
+            </section>
+        </section>
+    </main>
+</body>
+</html>

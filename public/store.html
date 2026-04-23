@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Place Order | PakkOrder</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+    <main class="page-shell">
+        <section class="surface auth-wrap" aria-label="Buyer order placement">
+            <aside class="auth-art">
+                <div class="shape a"></div>
+                <div class="shape b"></div>
+                <h1>Buyer Checkout</h1>
+                <p>
+                    Place an order for a seller by domain name.
+                    Orders are pushed directly to that seller's dashboard as pending confirmations.
+                </p>
+            </aside>
+
+            <section class="auth-panel">
+                <h2 class="panel-title">Place an order</h2>
+                <p class="panel-subtitle">Use the seller domain to route this order to the correct dashboard.</p>
+
+                <form id="orderForm" method="post" action="/store-order">
+                    <label for="domainName">Seller Domain</label>
+                    <input id="domainName" name="domainName" type="text" placeholder="shopname.local" value="{{ (form.domain_name if form else domain_name) }}" required />
+
+                    <label for="buyerName">Buyer Name</label>
+                    <input id="buyerName" name="buyerName" type="text" value="{{ (form.buyer_name if form else '') }}" required />
+
+                    <label for="phone">Buyer Phone</label>
+                    <input id="phone" name="phone" type="text" placeholder="+923001112233" value="{{ (form.phone if form else '') }}" required />
+
+                    <label for="address">Buyer Address</label>
+                    <input id="address" name="address" type="text" placeholder="House 12, Street 4, Lahore" value="{{ (form.address if form else '') }}" required />
+
+                    <label for="totalAmount">Order Amount (PKR)</label>
+                    <input id="totalAmount" name="totalAmount" type="text" placeholder="15000" value="{{ (form.total_amount if form else '') }}" required />
+
+                    <button id="placeOrderBtn" class="btn-primary" type="submit">Place order</button>
+                    {% with messages = get_flashed_messages(with_categories=true) %}
+                        {% if messages %}
+                            {% for category, message in messages %}
+                                <div class="message show {{ category }}" role="alert" aria-live="polite">{{ message }}</div>
+                            {% endfor %}
+                        {% endif %}
+                    {% endwith %}
+                </form>
+
+                <p class="auth-switch">Seller? <a href="/login">Open dashboard login</a></p>
+            </section>
+        </section>
+    </main>
+</body>
+</html>
