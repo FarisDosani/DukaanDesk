@@ -45,6 +45,7 @@ FALLBACK_ORDERS = [
         "OrderID": 1,
         "SellerOrderNo": 1,
         "BuyerID": 1,
+        "SellerBuyerNo": 1,
         "BuyerName": "Ahmed Khan",
         "Phone": "+923339876543",
         "DeliveryAddress": "Model Town, Lahore",
@@ -365,6 +366,7 @@ def filter_dashboard_orders(orders: list, raw_search: str) -> list:
         order_id = float(order.get("OrderID", 0) or 0)
         seller_order_no = float(order.get("SellerOrderNo", 0) or 0)
         buyer_id = float(order.get("BuyerID", 0) or 0)
+        seller_buyer_no = float(order.get("SellerBuyerNo", 0) or 0)
 
         text_pool = [
             str(order.get("BuyerName", "")).lower(),
@@ -377,7 +379,12 @@ def filter_dashboard_orders(orders: list, raw_search: str) -> list:
         ]
 
         if has_numeric and numeric_search is not None:
-            if order_id == numeric_search or seller_order_no == numeric_search or buyer_id == numeric_search:
+            if (
+                order_id == numeric_search
+                or seller_order_no == numeric_search
+                or buyer_id == numeric_search
+                or seller_buyer_no == numeric_search
+            ):
                 filtered.append(order)
                 continue
 
@@ -397,10 +404,11 @@ def fetch_orders_for_dashboard(seller_id: int, search: str):
                 O.OrderID,
                 O.SellerOrderNo,
                 B.BuyerID,
+                B.SellerBuyerNo,
                 S.DomainName,
-                B.FullName AS BuyerName,
+                COALESCE(O.BuyerName, B.FullName) AS BuyerName,
                 B.Phone,
-                B.Address AS DeliveryAddress,
+                COALESCE(O.DeliveryAddress, B.Address) AS DeliveryAddress,
                 O.TotalAmount,
                 O.OrderStatus,
                 O.DeliveryStatus,
@@ -456,7 +464,7 @@ def place_public_order(payload: dict) -> dict:
         # Reuse existing buyer by WhatsApp/phone so one number maps to one BuyerID per seller.
         cursor.execute(
             """
-            SELECT TOP 1 BuyerID
+            SELECT TOP 1 BuyerID, SellerBuyerNo
             FROM Buyers
             WHERE SellerID = ? AND Phone = ?
             """,
@@ -466,15 +474,7 @@ def place_public_order(payload: dict) -> dict:
 
         if existing_buyer:
             buyer_id = int(existing_buyer.BuyerID)
-            cursor.execute(
-                """
-                UPDATE Buyers
-                SET FullName = ?,
-                    Address = ?
-                WHERE BuyerID = ?
-                """,
-                (buyer_name, address, buyer_id),
-            )
+            seller_buyer_no = int(existing_buyer.SellerBuyerNo)
         else:
             cursor.execute(
                 """
@@ -511,13 +511,28 @@ def place_public_order(payload: dict) -> dict:
 
         cursor.execute(
             """
-            INSERT INTO Orders (SellerID, BuyerID, SellerOrderNo, TotalAmount, OrderStatus)
-            OUTPUT INSERTED.OrderID
-            VALUES (?, ?, ?, ?, 'Pending')
+            DECLARE @InsertedOrder TABLE (OrderID INT);
+
+            INSERT INTO Orders (SellerID, BuyerID, SellerOrderNo, BuyerName, DeliveryAddress, TotalAmount, OrderStatus)
+            OUTPUT INSERTED.OrderID INTO @InsertedOrder(OrderID)
+            VALUES (?, ?, ?, ?, ?, ?, 'Pending');
+
+            SELECT TOP 1 OrderID
+            FROM @InsertedOrder;
             """,
-            (seller_id, buyer_id, seller_order_no, total_amount),
+            (seller_id, buyer_id, seller_order_no, buyer_name, address, total_amount),
         )
-        inserted_order = cursor.fetchone()
+        inserted_order = None
+        while True:
+            try:
+                row = cursor.fetchone()
+            except pyodbc.ProgrammingError:
+                row = None
+            if row:
+                inserted_order = row
+                break
+            if not cursor.nextset():
+                break
         if not inserted_order or inserted_order[0] is None:
             raise RuntimeError("Unable to create order.")
         order_id = int(inserted_order[0])
@@ -528,6 +543,7 @@ def place_public_order(payload: dict) -> dict:
             "order_id": order_id,
             "seller_order_no": seller_order_no,
             "buyer_id": buyer_id,
+            "seller_buyer_no": seller_buyer_no,
             "seller_id": seller_id,
             "business_name": seller.BusinessName,
             "domain_name": domain_name,
@@ -795,7 +811,7 @@ def submit_store_order():
     try:
         result = place_public_order(payload)
         flash(
-            f"Order #{result['seller_order_no']} placed for {result['business_name']}. Buyer ID: {result['buyer_id']}.",
+            f"Order #{result['seller_order_no']} placed for {result['business_name']}. Buyer ID: {result['seller_buyer_no']}.",
             "success",
         )
         return render_template("store.html", domain_name=payload["domain_name"])

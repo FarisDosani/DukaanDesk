@@ -29,9 +29,12 @@
         {% endwith %}
 
         <section class="surface toolbar" aria-label="Search orders">
-            <form method="get" action="/dashboard" style="display: contents;">
+            <form method="get" action="/dashboard" class="toolbar-form">
                 <input id="searchInput" name="search" type="search" value="{{ search }}" placeholder="Search by order ID, buyer ID, buyer name, phone, address, update, action, status, amount, date..." aria-label="Search orders" />
-                <button id="refreshBtn" class="btn-tertiary" type="submit">Search</button>
+                <div class="toolbar-actions">
+                    <button id="searchBtn" class="btn-tertiary" type="submit">Search</button>
+                    <a id="refreshBtn" class="btn-tertiary btn-refresh" href="/dashboard" aria-label="Refresh dashboard">Refresh</a>
+                </div>
             </form>
         </section>
 
@@ -60,41 +63,61 @@
                         {% for order in orders %}
                             <tr>
                                 <td>#{{ order.SellerOrderNo or order.OrderID or '-' }}</td>
-                                <td>#{{ order.BuyerID or '-' }}</td>
+                                <td>#{{ order.SellerBuyerNo or order.BuyerID or '-' }}</td>
                                 <td>{{ order.BuyerName or '-' }}</td>
                                 <td>{{ order.Phone or '-' }}</td>
                                 <td>{{ order.OrderDate or '-' }}</td>
                                 <td class="amount">Rs. {{ order.TotalAmount }}</td>
-                                <td>{{ order.ActionTaken or '-' }}</td>
+                                <td>
+                                    {% if order.ActionTaken == 'Confirmed by seller' %}
+                                        <span class="status-chip action-confirmed">Confirmed by seller</span>
+                                    {% elif order.ActionTaken == 'Not confirmed by seller' %}
+                                        <span class="status-chip action-cancelled">Not confirmed by seller</span>
+                                    {% else %}
+                                        <span class="status-chip action-pending">Pending review</span>
+                                    {% endif %}
+                                </td>
                                 <td>{{ order.DeliveryAddress or '-' }}</td>
                                 <td>
                                     {% if order.OrderStatus == 'Pending' %}
-                                        <form method="post" action="/orders/{{ order.OrderID }}/action">
+                                        <form method="post" action="/orders/{{ order.OrderID }}/action" class="table-inline-form">
                                             <input type="hidden" name="search" value="{{ search }}" />
                                             <select class="status-select" name="action" required>
                                                 <option value="">Select action</option>
                                                 <option value="confirm">Confirm</option>
                                                 <option value="not_confirm">Not Confirm</option>
                                             </select>
-                                            <button class="btn-tertiary" type="submit" style="margin-top: 8px; min-height: 34px;">Apply</button>
+                                            <button class="btn-tertiary btn-mini" type="submit">Apply</button>
                                         </form>
+                                    {% elif order.OrderStatus == 'Confirmed' %}
+                                        <span class="status-chip action-confirmed">Confirmed</span>
+                                    {% elif order.OrderStatus == 'Cancelled' %}
+                                        <span class="status-chip action-cancelled">Not confirmed</span>
                                     {% else %}
                                         <span class="status-chip muted">Action completed</span>
                                     {% endif %}
                                 </td>
                                 <td>
                                     {% if order.OrderStatus == 'Confirmed' and (order.DeliveryStatus or 'Pending') == 'Pending' %}
-                                        <form method="post" action="/orders/{{ order.OrderID }}/status">
+                                        <form method="post" action="/orders/{{ order.OrderID }}/status" class="table-inline-form">
                                             <input type="hidden" name="search" value="{{ search }}" />
                                             <select class="status-select" name="status" required>
                                                 <option value="pending" selected>Pending</option>
                                                 <option value="delivered">Delivered</option>
                                                 <option value="returned_by_buyer">Returned by buyer</option>
                                             </select>
-                                            <button class="btn-tertiary" type="submit" style="margin-top: 8px; min-height: 34px;">Update</button>
+                                            <button class="btn-tertiary btn-mini" type="submit">Update</button>
                                         </form>
                                     {% elif order.OrderStatus == 'Confirmed' %}
-                                        <span class="status-chip muted">{{ order.DeliveryStatus }}</span>
+                                        {% if order.DeliveryStatus == 'Delivered' %}
+                                            <span class="status-chip status-delivered">Delivered</span>
+                                        {% elif order.DeliveryStatus == 'Returned by buyer' %}
+                                            <span class="status-chip status-returned">Returned by buyer</span>
+                                        {% else %}
+                                            <span class="status-chip status-pending">Pending</span>
+                                        {% endif %}
+                                    {% elif order.OrderStatus == 'Cancelled' %}
+                                        <span class="status-chip muted">Cancelled</span>
                                     {% else %}
                                         <span class="status-chip muted">-</span>
                                     {% endif %}

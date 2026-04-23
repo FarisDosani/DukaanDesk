@@ -59,6 +59,8 @@ CREATE TABLE Orders (
     SellerID INT NOT NULL FOREIGN KEY REFERENCES Sellers(SellerID),
     BuyerID INT NOT NULL FOREIGN KEY REFERENCES Buyers(BuyerID),
     SellerOrderNo INT NOT NULL,
+    BuyerName NVARCHAR(100) NULL,
+    DeliveryAddress NVARCHAR(255) NULL,
     TotalAmount DECIMAL(10,2) NOT NULL,
     OrderStatus NVARCHAR(20) DEFAULT 'Pending' CHECK (OrderStatus IN ('Pending', 'Confirmed', 'Cancelled')),
     DeliveryStatus NVARCHAR(30) NULL CHECK (DeliveryStatus IN ('Pending', 'Delivered', 'Returned by buyer')),

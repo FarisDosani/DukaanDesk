@@ -341,6 +341,28 @@ select:focus-visible {
     margin-bottom: 16px;
 }
 
+.toolbar-form {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 12px;
+    align-items: center;
+}
+
+.toolbar-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.btn-refresh {
+    min-height: 45px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
+    padding: 0 16px;
+}
+
 #searchInput {
     background: linear-gradient(180deg, #ffffff, #f7fbff);
 }
@@ -450,6 +472,36 @@ td {
     color: #5f7687;
 }
 
+.status-chip.action-pending,
+.status-chip.status-pending {
+    background: #fff3e2;
+    color: #a2550a;
+}
+
+.status-chip.action-confirmed,
+.status-chip.status-delivered {
+    background: #e5f8ee;
+    color: #126246;
+}
+
+.status-chip.action-cancelled,
+.status-chip.status-returned {
+    background: #ffe8e5;
+    color: #b42d1d;
+}
+
+.table-inline-form {
+    display: grid;
+    gap: 8px;
+    min-width: 150px;
+}
+
+.btn-mini {
+    min-height: 34px;
+    font-size: 0.82rem;
+    padding: 0 12px;
+}
+
 .amount {
     font-weight: 800;
     color: #0d5784;
@@ -531,6 +583,19 @@ td {
     .toolbar {
         grid-template-columns: 1fr;
         padding: 16px 18px;
+    }
+
+    .toolbar-form {
+        grid-template-columns: 1fr;
+    }
+
+    .toolbar-actions {
+        width: 100%;
+    }
+
+    .toolbar-actions .btn-tertiary,
+    .toolbar-actions .btn-refresh {
+        flex: 1;
     }
 
     .orders-header {
