@@ -24,6 +24,65 @@
     --shadow-focus: 0 0 0 4px rgba(28, 134, 199, 0.2);
 }
 
+/* Floating vertical navigation panel in top left blue area */
+.floating-nav {
+    position: fixed;
+    top: 32px;
+    left: 0;
+    z-index: 100;
+    display: flex;
+    flex-direction: column;
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(247, 252, 255, 0.92));
+    border: 1px solid var(--line);
+    border-radius: 0 16px 16px 0;
+    box-shadow: var(--shadow-soft);
+    backdrop-filter: blur(10px);
+    padding: 24px 12px 24px 8px;
+    min-width: 140px;
+    min-height: 120px;
+    gap: 16px;
+}
+
+.floating-nav .nav-link {
+    color: #224c6a;
+    text-decoration: none;
+    font-weight: 700;
+    font-size: 1.08rem;
+    padding: 10px 12px;
+    border: 1px solid #d3e3ef;
+    background: #f8fcff;
+    border-radius: 10px;
+    transition: background 0.15s, color 0.15s;
+    margin: 0 0 4px 0;
+    letter-spacing: 0.01em;
+}
+
+.floating-nav .nav-link.active,
+.floating-nav .nav-link:hover {
+    background: #e3f1fb;
+    border-color: #b8d7ec;
+    color: #123f5e;
+}
+
+@media (max-width: 700px) {
+    .floating-nav {
+        position: static;
+        flex-direction: row;
+        border-radius: 0 0 16px 16px;
+        min-width: unset;
+        min-height: unset;
+        padding: 8px 0 8px 0;
+        gap: 8px;
+        width: 100%;
+        justify-content: center;
+    }
+    .floating-nav .nav-link {
+        font-size: 1rem;
+        padding: 8px 10px;
+        margin: 0 4px 0 0;
+    }
+}
+
 * {
     box-sizing: border-box;
 }
@@ -327,18 +386,6 @@ select:focus-visible {
     align-items: center;
     padding: 22px;
     margin-bottom: 18px;
-}
-
-.topbar-left {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-}
-
-.header-nav {
-    display: grid;
-    gap: 8px;
-    min-width: 170px;
 }
 
 .dashboard-topbar {
@@ -813,16 +860,6 @@ td {
         flex-direction: column;
         align-items: flex-start;
         padding: 18px;
-    }
-
-    .topbar-left {
-        width: 100%;
-        flex-direction: column;
-        align-items: stretch;
-    }
-
-    .header-nav {
-        width: 100%;
     }
 
     .toolbar {

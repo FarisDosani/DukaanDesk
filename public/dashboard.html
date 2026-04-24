@@ -7,17 +7,15 @@
     <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
+    <nav class="floating-nav" aria-label="Seller navigation">
+        <a class="nav-link active" href="/dashboard" aria-current="page">Current Orders</a>
+        <a class="nav-link" href="/summary">Summary</a>
+    </nav>
     <main class="page-shell">
         <header class="surface topbar dashboard-topbar">
-            <div class="topbar-left">
-                <nav class="header-nav" aria-label="Seller navigation">
-                    <a class="nav-link active" href="/dashboard" aria-current="page">Current Orders</a>
-                    <a class="nav-link" href="/summary">Summary</a>
-                </nav>
-                <div class="identity">
-                    <h2 id="welcomeTitle">{{ user.business_name }} | Orders Dashboard</h2>
-                    <p id="identityLine">Signed in as {{ user.username }}{% if user.domain_name %} | Domain: {{ user.domain_name }}{% endif %}</p>
-                </div>
+            <div class="identity">
+                <h2 id="welcomeTitle">{{ user.business_name }} | Orders Dashboard</h2>
+                <p id="identityLine">Signed in as {{ user.username }}{% if user.domain_name %} | Domain: {{ user.domain_name }}{% endif %}</p>
             </div>
             <form method="post" action="/logout">
                 <button id="logoutBtn" class="btn-secondary" type="submit">Logout</button>
