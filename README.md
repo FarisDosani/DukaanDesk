@@ -13,8 +13,7 @@ A comprehensive, full-stack retail and inventory management system designed to h
 ## 🛠️ Tech Stack
 * **Frontend:** HTML5, CSS3 (`styles.css`)
 * **Backend:** Python (`app.py`, dependencies in `requirements.txt`)
-* **Database:** SQL (MySQL / PostgreSQL)
-* **Tooling:** Node.js/NPM (`package.json`)
+* **Database:** SQL (MySQL)
 
 ## 📁 Repository Structure
 The project is modularized into distinct frontend and backend layers:
