@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Client Login | PakkOrder</title>
+    <title>Client Login | DukaanDesk</title>
     <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -24,14 +24,15 @@
                 <p class="panel-subtitle">Sign in with your seller email, username, and password.</p>
 
                 <form id="loginForm" method="post" action="/login">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                     <label for="email">Email</label>
-                    <input id="email" name="email" type="email" autocomplete="email" value="{{ email or '' }}" required />
+                    <input id="email" name="email" type="email" autocomplete="email" maxlength="255" value="{{ email or '' }}" required />
 
                     <label for="username">Username</label>
-                    <input id="username" name="username" type="text" autocomplete="username" value="{{ username or '' }}" required />
+                    <input id="username" name="username" type="text" autocomplete="username" maxlength="100" value="{{ username or '' }}" required />
 
                     <label for="password">Password</label>
-                    <input id="password" name="password" type="password" autocomplete="current-password" required />
+                    <input id="password" name="password" type="password" autocomplete="current-password" maxlength="128" required />
 
                     <button id="loginBtn" class="btn-primary" type="submit">Sign in</button>
                     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -45,7 +46,9 @@
 
                 <p class="auth-switch">New client? <a href="/signup">Create your account</a></p>
 
-                <p class="hint">Demo fallback account (when auth table is missing): waqtoro@example.com / waqtoro-admin / admin123</p>
+                {% if demo_mode %}
+                    <p class="hint">Isolated demo mode is enabled. Use the demo credentials configured in the environment.</p>
+                {% endif %}
             </section>
         </section>
     </main>

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Place Order | PakkOrder</title>
+    <title>Place Order | DukaanDesk</title>
     <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -24,20 +24,21 @@
                 <p class="panel-subtitle">Use the seller domain to route this order to the correct dashboard.</p>
 
                 <form id="orderForm" method="post" action="/store-order">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                     <label for="domainName">Seller Domain</label>
-                    <input id="domainName" name="domainName" type="text" placeholder="shopname.local" value="{{ (form.domain_name if form else domain_name) }}" required />
+                    <input id="domainName" name="domainName" type="text" maxlength="120" pattern="[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?" placeholder="shopname.local" value="{{ (form.domain_name if form else domain_name) }}" required />
 
                     <label for="buyerName">Buyer Name</label>
-                    <input id="buyerName" name="buyerName" type="text" value="{{ (form.buyer_name if form else '') }}" required />
+                    <input id="buyerName" name="buyerName" type="text" maxlength="100" value="{{ (form.buyer_name if form else '') }}" required />
 
                     <label for="phone">Buyer Phone</label>
-                    <input id="phone" name="phone" type="text" placeholder="+923001112233" value="{{ (form.phone if form else '') }}" required />
+                    <input id="phone" name="phone" type="text" inputmode="tel" maxlength="20" placeholder="+923001112233" value="{{ (form.phone if form else '') }}" required />
 
                     <label for="address">Buyer Address</label>
-                    <input id="address" name="address" type="text" placeholder="House 12, Street 4, Lahore" value="{{ (form.address if form else '') }}" required />
+                    <input id="address" name="address" type="text" maxlength="255" placeholder="House 12, Street 4, Lahore" value="{{ (form.address if form else '') }}" required />
 
                     <label for="totalAmount">Order Amount (PKR)</label>
-                    <input id="totalAmount" name="totalAmount" type="text" placeholder="15000" value="{{ (form.total_amount if form else '') }}" required />
+                    <input id="totalAmount" name="totalAmount" type="number" inputmode="decimal" min="0.01" max="99999999.99" step="0.01" placeholder="15000" value="{{ (form.total_amount if form and form.total_amount is not none else '') }}" required />
 
                     <button id="placeOrderBtn" class="btn-primary" type="submit">Place order</button>
                     {% with messages = get_flashed_messages(with_categories=true) %}

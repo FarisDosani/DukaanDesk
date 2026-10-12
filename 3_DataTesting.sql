@@ -1,48 +1,50 @@
 USE CODManager;
 GO
 
--- ==========================================
--- STEP 1: WIPE OLD DATA
--- ==========================================
--- Delete in reverse order of relationships to avoid Foreign Key errors
-DELETE FROM MessageLogs;
-DELETE FROM Orders;
-DELETE FROM ClientUsers;
-DELETE FROM Buyers;
-DELETE FROM Sellers;
-GO
-
--- ==========================================
--- STEP 2: INSERT FRESH MOCK DATA (DYNAMICALLY)
--- ==========================================
--- Create variables to hold the IDs so we never have to guess them
+-- Optional, idempotent local sample data. This script never deletes rows.
+-- Seed login: waqtoro@example.com / waqtoro-admin / ChangeMe123!
 DECLARE @CurrentSellerID INT;
 DECLARE @CurrentBuyerID INT;
 
--- 1. Insert Seller
-INSERT INTO Sellers (BusinessName, WhatsAppNumber, Email, DomainName) 
-VALUES ('Waqtoro Watches', '+923001234567', 'waqtoro@example.com', 'waqtoro.local');
--- Instantly capture the ID that SQL Server just assigned to Waqtoro
-SET @CurrentSellerID = SCOPE_IDENTITY(); 
+SELECT @CurrentSellerID = SellerID
+FROM Sellers
+WHERE DomainName = 'waqtoro.local';
 
--- 2. Insert Buyer
-INSERT INTO Buyers (SellerID, FullName, Phone, Address, SellerBuyerNo) 
-VALUES (@CurrentSellerID, 'Ahmed Khan', '+923339876543', 'Model Town, Lahore', 1);
--- Instantly capture Ahmed's new ID
-SET @CurrentBuyerID = SCOPE_IDENTITY(); 
+IF @CurrentSellerID IS NULL
+BEGIN
+    INSERT INTO Sellers (BusinessName, WhatsAppNumber, Email, DomainName)
+    VALUES ('Waqtoro Watches', '+923001234567', 'waqtoro@example.com', 'waqtoro.local');
+    SET @CurrentSellerID = SCOPE_IDENTITY();
+END;
 
--- 3. Insert Order using those captured IDs!
-INSERT INTO Orders (SellerID, BuyerID, SellerOrderNo, TotalAmount) 
-VALUES (@CurrentSellerID, @CurrentBuyerID, 1, 15000.00);
+SELECT @CurrentBuyerID = BuyerID
+FROM Buyers
+WHERE SellerID = @CurrentSellerID AND Phone = '+923339876543';
 
--- 4. Insert Portal User (demo password for development only)
-INSERT INTO ClientUsers (SellerID, Username, PasswordHash)
-VALUES (@CurrentSellerID, 'waqtoro-admin', 'admin123');
+IF @CurrentBuyerID IS NULL
+BEGIN
+    INSERT INTO Buyers (SellerID, FullName, Phone, Address, SellerBuyerNo)
+    VALUES (@CurrentSellerID, 'Ahmed Khan', '+923339876543', 'Model Town, Lahore', 1);
+    SET @CurrentBuyerID = SCOPE_IDENTITY();
+END;
+
+IF NOT EXISTS (SELECT 1 FROM Orders WHERE SellerID = @CurrentSellerID AND SellerOrderNo = 1)
+BEGIN
+    INSERT INTO Orders (SellerID, BuyerID, SellerOrderNo, TotalAmount)
+    VALUES (@CurrentSellerID, @CurrentBuyerID, 1, 15000.00);
+END;
+
+IF NOT EXISTS (SELECT 1 FROM ClientUsers WHERE Username = 'waqtoro-admin')
+BEGIN
+    INSERT INTO ClientUsers (SellerID, Username, PasswordHash)
+    VALUES (
+        @CurrentSellerID,
+        'waqtoro-admin',
+        'scrypt:32768:8:1$k9ERLaY103PrTtGc$beae982830f4808911de507c972cd7ac05e98a0f3093f4bd3755e540d728abb55c5b6562d154d3acb3effd0f9064dd37daa7469be19e6179e39f39c163f8bfa4'
+    );
+END;
 GO
 
--- ==========================================
--- STEP 3: VIEW THE RESULTS
--- ==========================================
 SELECT * FROM Orders;
 SELECT * FROM vw_PendingConfirmations;
 SELECT * FROM MessageLogs;

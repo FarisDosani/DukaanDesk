@@ -1,20 +1,15 @@
--- ==========================================
--- STEP 1: THE NUKE (Resetting the database)
--- ==========================================
+-- Fresh-install schema for DukaanDesk.
+-- Safety: this script refuses to run when CODManager already exists.
+-- Use 5_Migration.sql for an existing database; never drop production data.
 USE master;
 GO
 
--- If the database exists, force close all connections and delete it
 IF EXISTS (SELECT name FROM sys.databases WHERE name = N'CODManager')
 BEGIN
-    ALTER DATABASE CODManager SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
-    DROP DATABASE CODManager;
+    THROW 50001, 'CODManager already exists. Aborting to preserve existing data; use 5_Migration.sql instead.', 1;
 END
 GO
 
--- ==========================================
--- STEP 2: THE REBUILD (Creating fresh)
--- ==========================================
 CREATE DATABASE CODManager;
 GO
 USE CODManager;
@@ -38,7 +33,8 @@ CREATE TABLE Buyers (
     Address NVARCHAR(255) NOT NULL,
     SellerBuyerNo INT NOT NULL,
     CONSTRAINT UQ_Buyers_SellerBuyerNo UNIQUE (SellerID, SellerBuyerNo),
-    CONSTRAINT UQ_Buyers_SellerPhone UNIQUE (SellerID, Phone)
+    CONSTRAINT UQ_Buyers_SellerPhone UNIQUE (SellerID, Phone),
+    CONSTRAINT UQ_Buyers_SellerBuyerIdentity UNIQUE (SellerID, BuyerID)
 );
 
 -- 2b. ClientUsers Table (portal login accounts per seller)
@@ -62,10 +58,20 @@ CREATE TABLE Orders (
     BuyerName NVARCHAR(100) NULL,
     DeliveryAddress NVARCHAR(255) NULL,
     TotalAmount DECIMAL(10,2) NOT NULL,
-    OrderStatus NVARCHAR(20) DEFAULT 'Pending' CHECK (OrderStatus IN ('Pending', 'Confirmed', 'Cancelled')),
-    DeliveryStatus NVARCHAR(30) NULL CHECK (DeliveryStatus IN ('Pending', 'Delivered', 'Returned by buyer')),
-    OrderDate DATETIME2 DEFAULT GETDATE(),
-    CONSTRAINT UQ_Orders_SellerOrderNo UNIQUE (SellerID, SellerOrderNo)
+    OrderStatus NVARCHAR(20) NOT NULL DEFAULT 'Pending',
+    DeliveryStatus NVARCHAR(30) NULL,
+    OrderDate DATETIME2 NOT NULL DEFAULT GETDATE(),
+    CONSTRAINT UQ_Orders_SellerOrderNo UNIQUE (SellerID, SellerOrderNo),
+    CONSTRAINT CK_Orders_PositiveAmount CHECK (TotalAmount > 0),
+    CONSTRAINT CK_Orders_AllowedOrderStatus CHECK (OrderStatus IN ('Pending', 'Confirmed', 'Cancelled')),
+    CONSTRAINT CK_Orders_AllowedDeliveryStatus CHECK (DeliveryStatus IN ('Pending', 'Delivered', 'Returned by buyer')),
+    CONSTRAINT CK_Orders_StateConsistency CHECK (
+        (OrderStatus = 'Pending' AND DeliveryStatus IS NULL)
+        OR (OrderStatus = 'Confirmed' AND DeliveryStatus IS NOT NULL)
+        OR (OrderStatus = 'Cancelled' AND DeliveryStatus IS NULL)
+    ),
+    CONSTRAINT FK_Orders_SellerBuyer FOREIGN KEY (SellerID, BuyerID)
+        REFERENCES Buyers(SellerID, BuyerID)
 );
 
 -- 4. MessageLogs (The Weak Entity)

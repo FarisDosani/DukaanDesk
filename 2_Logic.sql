@@ -25,10 +25,10 @@ ON Orders
 AFTER INSERT
 AS
 BEGIN
-    DECLARE @NewOrderID INT;
-    SELECT @NewOrderID = inserted.OrderID FROM inserted;
+    SET NOCOUNT ON;
 
     INSERT INTO MessageLogs (OrderID, MessageContent)
-    VALUES (@NewOrderID, 'System: Initial WhatsApp confirmation message queued.');
+    SELECT OrderID, 'System: Initial WhatsApp confirmation message queued.'
+    FROM inserted;
 END;
 GO

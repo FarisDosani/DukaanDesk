@@ -1,48 +1,104 @@
+import hmac
 import os
-from datetime import datetime
+import re
+import secrets
+from copy import deepcopy
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from functools import wraps
 
 import pyodbc
-from flask import Flask, flash, redirect, render_template, request, session, url_for
+from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, min(value, maximum))
+
+
+def odbc_value(value: str) -> str:
+    """Wrap an ODBC value so semicolons and braces cannot alter the DSN."""
+    return "{" + str(value).replace("}", "}}") + "}"
 
 
 def build_connection_string() -> str:
     db_server = os.getenv("DB_SERVER", ".\\SQLEXPRESS")
     db_port = os.getenv("DB_PORT")
     db_name = os.getenv("DB_NAME", "CODManager")
+    db_driver = os.getenv("DB_DRIVER", "ODBC Driver 18 for SQL Server")
+    db_username = os.getenv("DB_USERNAME")
+    db_password = os.getenv("DB_PASSWORD")
     server = f"{db_server},{db_port}" if db_port else db_server
-    return (
-        "Driver={ODBC Driver 18 for SQL Server};"
-        f"Server={server};"
-        f"Database={db_name};"
-        "Trusted_Connection=Yes;"
-        "TrustServerCertificate=Yes;"
-        "Encrypt=No;"
+    parts = [
+        f"Driver={odbc_value(db_driver)}",
+        f"Server={odbc_value(server)}",
+        f"Database={odbc_value(db_name)}",
+    ]
+
+    if db_username and db_password:
+        parts.extend([f"UID={odbc_value(db_username)}", f"PWD={odbc_value(db_password)}"])
+    else:
+        parts.append("Trusted_Connection=Yes")
+
+    parts.extend(
+        [
+            f"Encrypt={'Yes' if env_flag('DB_ENCRYPT', True) else 'No'}",
+            f"TrustServerCertificate={'Yes' if env_flag('DB_TRUST_SERVER_CERTIFICATE', False) else 'No'}",
+            f"Connection Timeout={env_int('DB_CONNECTION_TIMEOUT', 5, 1, 60)}",
+        ]
     )
+    return ";".join(parts) + ";"
 
 
 CONNECTION_STRING = build_connection_string()
 
 app = Flask(__name__, template_folder="public", static_folder="public", static_url_path="/static")
-app.secret_key = os.getenv("SESSION_SECRET", "change-this-secret-in-production")
+configured_session_secret = os.getenv("SESSION_SECRET")
+app.secret_key = configured_session_secret or secrets.token_hex(32)
+app.config.update(
+    MAX_CONTENT_LENGTH=1024 * 1024,
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=env_flag("SESSION_COOKIE_SECURE", False),
+)
+if not configured_session_secret:
+    app.logger.warning("SESSION_SECRET is not set; sessions will be invalidated when the process restarts.")
 
 
-DEMO_USERS = {
-    "waqtoro-admin": {
+DEMO_MODE = env_flag("DEMO_MODE", False)
+DEMO_PASSWORD = os.getenv("DEMO_PASSWORD")
+DEMO_USERS = {}
+if DEMO_MODE and DEMO_PASSWORD:
+    demo_username = os.getenv("DEMO_USERNAME", "waqtoro-admin")
+    DEMO_USERS[demo_username] = {
         "id": 1,
-        "email": "waqtoro@example.com",
-        "username": "waqtoro-admin",
-        "password": "admin123",
+        "email": os.getenv("DEMO_EMAIL", "waqtoro@example.com").strip().lower(),
+        "username": demo_username,
+        "password_hash": generate_password_hash(DEMO_PASSWORD),
         "seller_id": 1,
-        "business_name": "Waqtoro Watches",
-        "domain_name": "waqtoro.local",
+        "business_name": os.getenv("DEMO_BUSINESS_NAME", "Waqtoro Watches"),
+        "domain_name": os.getenv("DEMO_DOMAIN", "waqtoro.local").strip().lower(),
     }
-}
+elif DEMO_MODE:
+    app.logger.warning("DEMO_MODE is enabled but DEMO_PASSWORD is missing; demo login is disabled.")
 DEMO_FAILED_ATTEMPTS = {}
 
-FALLBACK_ORDERS = [
+DEMO_ORDERS = [
     {
         "OrderID": 1,
+        "SellerID": 1,
         "SellerOrderNo": 1,
         "BuyerID": 1,
         "SellerBuyerNo": 1,
@@ -59,11 +115,75 @@ FALLBACK_ORDERS = [
 
 
 def get_db_connection():
-    return pyodbc.connect(CONNECTION_STRING)
+    return pyodbc.connect(
+        CONNECTION_STRING,
+        timeout=env_int("DB_CONNECTION_TIMEOUT", 5, 1, 60),
+    )
 
 
 def normalize_domain_name(value: str) -> str:
     return str(value or "").strip().lower()
+
+
+DOMAIN_RE = re.compile(
+    r"^(?=.{1,120}$)(?!-)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?!-)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
+)
+USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,100}$")
+
+
+def validate_signup_payload(payload: dict) -> str | None:
+    required = (
+        "business_name",
+        "whatsapp_number",
+        "email",
+        "domain_name",
+        "username",
+        "password",
+        "confirm_password",
+    )
+    if not all(payload.get(field) for field in required):
+        return "Please fill all signup fields."
+    if len(payload["business_name"]) > 100:
+        return "Business name must be 100 characters or fewer."
+    if len(payload["whatsapp_number"]) > 20:
+        return "WhatsApp number must be 20 characters or fewer."
+    if len(payload["email"]) > 255 or "@" not in payload["email"] or "." not in payload["email"].split("@")[-1]:
+        return "Please provide a valid email address."
+    if not DOMAIN_RE.fullmatch(payload["domain_name"]):
+        return "Enter a valid domain using letters, numbers, dots, and hyphens."
+    if not USERNAME_RE.fullmatch(payload["username"]):
+        return "Username must be 3-100 characters using letters, numbers, dots, underscores, or hyphens."
+    if len(payload["password"]) < 10:
+        return "Password must be at least 10 characters."
+    if len(payload["password"]) > 128:
+        return "Password must be 128 characters or fewer."
+    if payload["password"] != payload["confirm_password"]:
+        return "Passwords do not match."
+    return None
+
+
+def parse_order_amount(value) -> Decimal | None:
+    try:
+        amount = Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not amount.is_finite() or amount < Decimal("0.01") or amount > Decimal("99999999.99"):
+        return None
+    return amount.quantize(Decimal("0.01"))
+
+
+def validate_order_payload(payload: dict) -> str | None:
+    if not DOMAIN_RE.fullmatch(payload["domain_name"]):
+        return "Please enter a valid seller domain."
+    if not payload["buyer_name"] or len(payload["buyer_name"]) > 100:
+        return "Buyer name is required and must be 100 characters or fewer."
+    if not payload["phone"] or len(payload["phone"]) > 20:
+        return "Phone is required and must be 20 characters or fewer."
+    if not payload["address"] or len(payload["address"]) > 255:
+        return "Address is required and must be 255 characters or fewer."
+    if payload.get("total_amount") is None:
+        return "Order amount must be between 0.01 and 99,999,999.99."
+    return None
 
 
 def is_account_locked(attempts: int) -> bool:
@@ -78,7 +198,60 @@ def build_user_session(user: dict) -> dict:
         "seller_id": user["seller_id"],
         "business_name": user["business_name"],
         "domain_name": user.get("domain_name"),
+        "is_demo": bool(user.get("is_demo", False)),
     }
+
+
+def password_is_hashed(value: str) -> bool:
+    return str(value or "").startswith(("scrypt:", "pbkdf2:"))
+
+
+def verify_password(stored_value: str, candidate: str) -> tuple[bool, bool]:
+    """Return (matches, needs_upgrade) for current hashes and legacy plaintext."""
+    stored_value = str(stored_value or "")
+    if password_is_hashed(stored_value):
+        try:
+            return check_password_hash(stored_value, candidate), False
+        except (TypeError, ValueError):
+            return False, False
+    return hmac.compare_digest(stored_value, candidate), True
+
+
+def get_csrf_token() -> str:
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+@app.context_processor
+def inject_csrf_token():
+    return {"csrf_token": get_csrf_token, "demo_mode": DEMO_MODE and bool(DEMO_USERS)}
+
+
+@app.before_request
+def protect_post_requests():
+    if request.method != "POST":
+        return None
+    expected = str(session.get("csrf_token", ""))
+    supplied = str(request.form.get("csrf_token", ""))
+    if not expected or not supplied or not hmac.compare_digest(expected, supplied):
+        abort(400, description="Invalid or missing CSRF token.")
+    return None
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if request.is_secure:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    if session.get("user"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 
 def db_error_text(err: Exception) -> str:
@@ -106,13 +279,26 @@ def is_duplicate_constraint_error(err: Exception) -> bool:
 
 def is_sql_connection_error(err: Exception) -> bool:
     text = db_error_text(err)
-    return "data source name not found" in text or "[im002]" in text
+    markers = (
+        "data source name not found",
+        "[im002]",
+        "08001",
+        "08000",
+        "08s01",
+        "hyt00",
+        "hyt01",
+        "login timeout",
+    )
+    return any(marker in text for marker in markers)
 
 
 def require_auth(view_fn):
     @wraps(view_fn)
     def wrapped(*args, **kwargs):
         if "user" not in session:
+            return redirect(url_for("login"))
+        if session["user"].get("is_demo") and not (DEMO_MODE and DEMO_USERS):
+            session.clear()
             return redirect(url_for("login"))
         return view_fn(*args, **kwargs)
 
@@ -154,7 +340,8 @@ def login_with_database(email: str, username: str, password: str) -> dict:
                 "message": "Account locked after 3 failed attempts. Contact support.",
             }
 
-        if password != row.PasswordHash:
+        password_matches, needs_upgrade = verify_password(row.PasswordHash, password)
+        if not password_matches:
             updated_attempts = failed_attempts + 1
             should_lock = 1 if updated_attempts >= 3 else 0
             cursor.execute(
@@ -183,16 +370,29 @@ def login_with_database(email: str, username: str, password: str) -> dict:
                 "attempts_left": 3 - updated_attempts,
             }
 
-        cursor.execute(
-            """
-            UPDATE ClientUsers
-            SET FailedAttempts = 0,
-                IsLocked = 0,
-                LastFailedAt = NULL
-            WHERE UserID = ?
-            """,
-            (row.UserID,),
-        )
+        if needs_upgrade:
+            cursor.execute(
+                """
+                UPDATE ClientUsers
+                SET PasswordHash = ?,
+                    FailedAttempts = 0,
+                    IsLocked = 0,
+                    LastFailedAt = NULL
+                WHERE UserID = ?
+                """,
+                (generate_password_hash(password), row.UserID),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE ClientUsers
+                SET FailedAttempts = 0,
+                    IsLocked = 0,
+                    LastFailedAt = NULL
+                WHERE UserID = ?
+                """,
+                (row.UserID,),
+            )
         conn.commit()
 
         return {
@@ -223,7 +423,7 @@ def login_with_demo_user(email: str, username: str, password: str) -> dict:
             "message": "Account locked after 3 failed attempts. Contact support.",
         }
 
-    if user["password"] != password:
+    if not check_password_hash(user["password_hash"], password):
         updated_attempts = failed_attempts + 1
         DEMO_FAILED_ATTEMPTS[username] = updated_attempts
 
@@ -251,6 +451,7 @@ def login_with_demo_user(email: str, username: str, password: str) -> dict:
             "seller_id": user["seller_id"],
             "business_name": user["business_name"],
             "domain_name": user["domain_name"],
+            "is_demo": True,
         },
     }
 
@@ -276,51 +477,32 @@ def signup_with_database(payload: dict) -> dict:
         )
         linked_seller = cursor.fetchone()
 
-        resolved_business_name = business_name
-        resolved_email = email
-        resolved_domain_name = domain_name
-
         if linked_seller:
-            same_business = str(linked_seller.BusinessName).lower() == business_name.lower()
-            same_whatsapp = str(linked_seller.WhatsAppNumber) == whatsapp_number
-            same_email = str(linked_seller.Email or "").lower() == email
+            raise ValueError("DOMAIN_ALREADY_LINKED")
 
-            if not (same_business and same_whatsapp and same_email):
-                raise ValueError("DOMAIN_ALREADY_LINKED")
+        cursor.execute(
+            """
+            SELECT TOP 1 SellerID
+            FROM Sellers
+            WHERE WhatsAppNumber = ?
+            """,
+            (whatsapp_number,),
+        )
+        if cursor.fetchone():
+            raise ValueError("WHATSAPP_ALREADY_LINKED")
 
-            seller_id = int(linked_seller.SellerID)
-            resolved_business_name = linked_seller.BusinessName
-            resolved_email = linked_seller.Email
-            resolved_domain_name = linked_seller.DomainName
-        else:
-            cursor.execute(
-                """
-                SELECT TOP 1 SellerID, BusinessName, DomainName
-                FROM Sellers
-                WHERE WhatsAppNumber = ?
-                """,
-                (whatsapp_number,),
-            )
-            existing_whatsapp = cursor.fetchone()
-
-            if existing_whatsapp:
-                same_business = str(existing_whatsapp.BusinessName).lower() == business_name.lower()
-                if not same_business:
-                    raise ValueError("WHATSAPP_ALREADY_LINKED")
-                raise ValueError("WHATSAPP_DOMAIN_REQUIRED")
-
-            cursor.execute(
-                """
-                INSERT INTO Sellers (BusinessName, WhatsAppNumber, Email, DomainName)
-                OUTPUT INSERTED.SellerID
-                VALUES (?, ?, ?, ?)
-                """,
-                (business_name, whatsapp_number, email, domain_name),
-            )
-            inserted_seller = cursor.fetchone()
-            if not inserted_seller or inserted_seller[0] is None:
-                raise RuntimeError("Unable to create seller account.")
-            seller_id = int(inserted_seller[0])
+        cursor.execute(
+            """
+            INSERT INTO Sellers (BusinessName, WhatsAppNumber, Email, DomainName)
+            OUTPUT INSERTED.SellerID
+            VALUES (?, ?, ?, ?)
+            """,
+            (business_name, whatsapp_number, email, domain_name),
+        )
+        inserted_seller = cursor.fetchone()
+        if not inserted_seller or inserted_seller[0] is None:
+            raise RuntimeError("Unable to create seller account.")
+        seller_id = int(inserted_seller[0])
 
         cursor.execute(
             """
@@ -328,7 +510,7 @@ def signup_with_database(payload: dict) -> dict:
             OUTPUT INSERTED.UserID
             VALUES (?, ?, ?)
             """,
-            (seller_id, payload["username"], payload["password"]),
+            (seller_id, payload["username"], generate_password_hash(payload["password"])),
         )
         inserted_user = cursor.fetchone()
         if not inserted_user or inserted_user[0] is None:
@@ -339,11 +521,11 @@ def signup_with_database(payload: dict) -> dict:
 
         return {
             "id": user_id,
-            "email": resolved_email,
+            "email": email,
             "username": payload["username"],
             "seller_id": seller_id,
-            "business_name": resolved_business_name,
-            "domain_name": resolved_domain_name,
+            "business_name": business_name,
+            "domain_name": domain_name,
         }
     except Exception:
         conn.rollback()
@@ -359,7 +541,10 @@ def filter_dashboard_orders(orders: list, raw_search: str) -> list:
 
     cleaned_numeric = "".join(ch for ch in search if (ch.isdigit() or ch in ".-"))
     has_numeric = bool(cleaned_numeric)
-    numeric_search = float(cleaned_numeric) if has_numeric else None
+    try:
+        numeric_search = float(cleaned_numeric) if has_numeric else None
+    except ValueError:
+        numeric_search = None
 
     filtered = []
     for order in orders:
@@ -394,7 +579,19 @@ def filter_dashboard_orders(orders: list, raw_search: str) -> list:
     return filtered
 
 
-def fetch_orders_for_dashboard(seller_id: int, search: str = "", apply_search: bool = True):
+def fetch_orders_for_dashboard(
+    seller_id: int,
+    search: str = "",
+    apply_search: bool = True,
+    allow_demo: bool = False,
+):
+    if allow_demo and DEMO_MODE and DEMO_USERS:
+        rows = [deepcopy(row) for row in DEMO_ORDERS if row["SellerID"] == seller_id]
+        if apply_search:
+            rows = filter_dashboard_orders(rows, search)
+        return rows, "demo"
+
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -428,15 +625,15 @@ def fetch_orders_for_dashboard(seller_id: int, search: str = "", apply_search: b
         )
         columns = [desc[0] for desc in cursor.description]
         rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
-        conn.close()
         if apply_search:
             rows = filter_dashboard_orders(rows, search)
         return rows, "database"
-    except Exception:
-        scoped = [row for row in FALLBACK_ORDERS if row["OrderID"] == 1 or seller_id == 1]
-        if apply_search:
-            scoped = filter_dashboard_orders(scoped, search)
-        return scoped, "fallback"
+    except Exception as err:
+        app.logger.error("Dashboard order query failed: %s", err)
+        return [], "database unavailable"
+    finally:
+        if conn:
+            conn.close()
 
 
 def is_active_dashboard_order(order: dict) -> bool:
@@ -556,17 +753,25 @@ def build_summary_sections(orders: list) -> list:
 
 
 def build_dashboard_kpis(all_orders: list, active_orders: list) -> dict:
-    revenue = sum(float(order.get("TotalAmount", 0) or 0) for order in all_orders if str(order.get("DeliveryStatus", "") or "") == "Delivered")
+    revenue = sum(
+        float(order.get("TotalAmount", 0) or 0)
+        for order in all_orders
+        if str(order.get("DeliveryStatus", "") or "").strip().lower() == "delivered"
+    )
     cancelled_or_returned = sum(
         1
         for order in all_orders
-        if (str(order.get("OrderStatus", "") or "") == "Cancelled")
-        or (str(order.get("DeliveryStatus", "") or "") == "Returned by buyer")
+        if (str(order.get("OrderStatus", "") or "").strip().lower() == "cancelled")
+        or (str(order.get("DeliveryStatus", "") or "").strip().lower() == "returned by buyer")
     )
     return {
         "total": len(all_orders),
         "pending": len(active_orders),
-        "confirmed": sum(1 for order in all_orders if str(order.get("OrderStatus", "") or "") == "Confirmed"),
+        "confirmed": sum(
+            1
+            for order in all_orders
+            if str(order.get("OrderStatus", "") or "").strip().lower() == "confirmed"
+        ),
         "cancelled_or_returned": cancelled_or_returned,
         "revenue": revenue,
     }
@@ -580,14 +785,15 @@ def place_public_order(payload: dict) -> dict:
     buyer_name = payload["buyer_name"].strip()
     phone = payload["phone"].strip()
     address = payload["address"].strip()
-    total_amount = float(payload["total_amount"])
+    total_amount = Decimal(payload["total_amount"])
 
     try:
         cursor = conn.cursor()
+        cursor.execute("SET XACT_ABORT ON;")
         cursor.execute(
             """
             SELECT TOP 1 SellerID, BusinessName
-            FROM Sellers
+            FROM Sellers WITH (UPDLOCK, HOLDLOCK)
             WHERE DomainName = ?
             """,
             (domain_name,),
@@ -602,7 +808,7 @@ def place_public_order(payload: dict) -> dict:
         cursor.execute(
             """
             SELECT TOP 1 BuyerID, SellerBuyerNo
-            FROM Buyers
+            FROM Buyers WITH (UPDLOCK, HOLDLOCK)
             WHERE SellerID = ? AND Phone = ?
             """,
             (seller_id, phone),
@@ -616,7 +822,7 @@ def place_public_order(payload: dict) -> dict:
             cursor.execute(
                 """
                 SELECT ISNULL(MAX(SellerBuyerNo), 0) + 1 AS NextSellerBuyerNo
-                FROM Buyers
+                FROM Buyers WITH (UPDLOCK, HOLDLOCK)
                 WHERE SellerID = ?
                 """,
                 (seller_id,),
@@ -639,7 +845,7 @@ def place_public_order(payload: dict) -> dict:
         cursor.execute(
             """
             SELECT ISNULL(MAX(SellerOrderNo), 0) + 1 AS NextSellerOrderNo
-            FROM Orders
+            FROM Orders WITH (UPDLOCK, HOLDLOCK)
             WHERE SellerID = ?
             """,
             (seller_id,),
@@ -692,6 +898,76 @@ def place_public_order(payload: dict) -> dict:
         conn.close()
 
 
+def place_demo_order(payload: dict) -> dict:
+    if not DEMO_MODE or not DEMO_USERS:
+        raise LookupError("SELLER_NOT_FOUND")
+    demo_user = next(iter(DEMO_USERS.values()))
+    if payload["domain_name"] != demo_user["domain_name"]:
+        raise LookupError("SELLER_NOT_FOUND")
+
+    seller_id = int(demo_user["seller_id"])
+    matching_buyers = [
+        row for row in DEMO_ORDERS if row["SellerID"] == seller_id and row["Phone"] == payload["phone"]
+    ]
+    if matching_buyers:
+        buyer_id = int(matching_buyers[0]["BuyerID"])
+        seller_buyer_no = int(matching_buyers[0]["SellerBuyerNo"])
+    else:
+        seller_buyer_no = max(
+            (int(row["SellerBuyerNo"]) for row in DEMO_ORDERS if row["SellerID"] == seller_id),
+            default=0,
+        ) + 1
+        buyer_id = max((int(row["BuyerID"]) for row in DEMO_ORDERS), default=0) + 1
+
+    seller_order_no = max(
+        (int(row["SellerOrderNo"]) for row in DEMO_ORDERS if row["SellerID"] == seller_id),
+        default=0,
+    ) + 1
+    order_id = max((int(row["OrderID"]) for row in DEMO_ORDERS), default=0) + 1
+    DEMO_ORDERS.append(
+        {
+            "OrderID": order_id,
+            "SellerID": seller_id,
+            "SellerOrderNo": seller_order_no,
+            "BuyerID": buyer_id,
+            "SellerBuyerNo": seller_buyer_no,
+            "BuyerName": payload["buyer_name"],
+            "Phone": payload["phone"],
+            "DeliveryAddress": payload["address"],
+            "TotalAmount": payload["total_amount"],
+            "OrderStatus": "Pending",
+            "DeliveryStatus": None,
+            "ActionTaken": "Pending review",
+            "OrderDate": datetime.now(),
+        }
+    )
+    return {
+        "order_id": order_id,
+        "seller_order_no": seller_order_no,
+        "buyer_id": buyer_id,
+        "seller_buyer_no": seller_buyer_no,
+        "seller_id": seller_id,
+        "business_name": demo_user["business_name"],
+        "domain_name": demo_user["domain_name"],
+    }
+
+
+def update_demo_order(order_id: int, seller_id: int, *, action: str | None = None, status: str | None = None) -> bool:
+    for order in DEMO_ORDERS:
+        if int(order["OrderID"]) != order_id or int(order["SellerID"]) != seller_id:
+            continue
+        if action and order["OrderStatus"] == "Pending":
+            order["OrderStatus"] = "Confirmed" if action == "confirm" else "Cancelled"
+            order["DeliveryStatus"] = "Pending" if action == "confirm" else None
+            order["ActionTaken"] = "Confirmed by seller" if action == "confirm" else "Not confirmed by seller"
+            return True
+        if status and order["OrderStatus"] == "Confirmed" and order["DeliveryStatus"] == "Pending":
+            order["DeliveryStatus"] = status
+            return True
+        return False
+    return False
+
+
 @app.get("/")
 def home():
     if session.get("user"):
@@ -721,19 +997,31 @@ def login():
             flash(db_login.get("message", "Login failed."), "warn" if db_login.get("status") == 423 else "error")
             return render_template("login.html", email=email, username=username)
 
+        session.clear()
         session["user"] = build_user_session(db_login["user"])
+        session.permanent = True
+        get_csrf_token()
         return redirect(url_for("dashboard"))
     except Exception as err:
-        if not is_missing_auth_table(err):
-            app.logger.error("Database login check failed: %s", err)
+        app.logger.error("Database login check failed: %s", err)
+
+        if not DEMO_MODE:
+            if is_missing_auth_table(err):
+                flash("Login table is missing. Run the database setup or migration first.", "error")
+            else:
+                flash("Database login is unavailable. Check the server configuration.", "error")
+            return render_template("login.html", email=email, username=username)
 
         demo_login = login_with_demo_user(email, username, password)
         if not demo_login.get("ok"):
             flash(demo_login.get("message", "Invalid username or password."), "warn" if demo_login.get("status") == 423 else "error")
             return render_template("login.html", email=email, username=username)
 
+        session.clear()
         session["user"] = build_user_session(demo_login["user"])
-        flash("Logged in using fallback demo account.", "warn")
+        session.permanent = True
+        get_csrf_token()
+        flash("Logged in to isolated demo mode. Demo changes are not persisted.", "warn")
         return redirect(url_for("dashboard"))
 
 
@@ -755,39 +1043,17 @@ def signup():
         "confirm_password": str(request.form.get("confirmPassword", "")),
     }
 
-    if not all(
-        [
-            payload["business_name"],
-            payload["whatsapp_number"],
-            payload["email"],
-            payload["domain_name"],
-            payload["username"],
-            payload["password"],
-            payload["confirm_password"],
-        ]
-    ):
-        flash("Please fill all signup fields.", "error")
-        return render_template("signup.html", form=payload)
-
-    if "@" not in payload["email"] or "." not in payload["email"].split("@")[-1]:
-        flash("Please provide a valid email address.", "error")
-        return render_template("signup.html", form=payload)
-
-    if not all(ch.isalnum() or ch in ".-" for ch in payload["domain_name"]):
-        flash("Domain name can only contain letters, numbers, dots, and hyphens.", "error")
-        return render_template("signup.html", form=payload)
-
-    if len(payload["password"]) < 6:
-        flash("Password must be at least 6 characters.", "error")
-        return render_template("signup.html", form=payload)
-
-    if payload["password"] != payload["confirm_password"]:
-        flash("Passwords do not match.", "error")
+    validation_error = validate_signup_payload(payload)
+    if validation_error:
+        flash(validation_error, "error")
         return render_template("signup.html", form=payload)
 
     try:
         created_user = signup_with_database(payload)
+        session.clear()
         session["user"] = build_user_session(created_user)
+        session.permanent = True
+        get_csrf_token()
         flash("Signup successful.", "success")
         return redirect(url_for("dashboard"))
     except ValueError as err:
@@ -796,8 +1062,6 @@ def signup():
             flash("This WhatsApp number is already linked to another business.", "warn")
         elif code == "DOMAIN_ALREADY_LINKED":
             flash("This domain is already linked to another seller.", "warn")
-        elif code == "WHATSAPP_DOMAIN_REQUIRED":
-            flash("This business already exists with a different domain. Use the original domain assigned to this seller.", "warn")
         else:
             flash("Signup failed.", "error")
         return render_template("signup.html", form=payload)
@@ -825,7 +1089,9 @@ def logout():
 def dashboard():
     user = session["user"]
     search = str(request.args.get("search", "")).strip()
-    all_orders, source = fetch_orders_for_dashboard(user["seller_id"], apply_search=False)
+    all_orders, source = fetch_orders_for_dashboard(
+        user["seller_id"], apply_search=False, allow_demo=user.get("is_demo", False)
+    )
     active_orders = [order for order in all_orders if is_active_dashboard_order(order)]
     active_orders = filter_dashboard_orders(active_orders, search)
     kpis = build_dashboard_kpis(all_orders, active_orders)
@@ -844,7 +1110,9 @@ def dashboard():
 @require_auth
 def summary_page():
     user = session["user"]
-    all_orders, source = fetch_orders_for_dashboard(user["seller_id"], apply_search=False)
+    all_orders, source = fetch_orders_for_dashboard(
+        user["seller_id"], apply_search=False, allow_demo=user.get("is_demo", False)
+    )
     active_orders = [order for order in all_orders if is_active_dashboard_order(order)]
     summary_sections = build_summary_sections(all_orders)
     kpis = build_dashboard_kpis(all_orders, active_orders)
@@ -869,6 +1137,13 @@ def update_order_action(order_id: int):
     next_status = "Confirmed" if action == "confirm" else "Cancelled"
     next_delivery_status = "Pending" if action == "confirm" else None
 
+    if session["user"].get("is_demo"):
+        updated = update_demo_order(
+            order_id, session["user"]["seller_id"], action=action
+        )
+        flash("Demo order action updated." if updated else "Only pending demo orders can be updated.", "success" if updated else "warn")
+        return redirect(url_for("dashboard", search=request.form.get("search", "")))
+
     conn = None
     try:
         conn = get_db_connection()
@@ -880,17 +1155,29 @@ def update_order_action(order_id: int):
                 DeliveryStatus = ?
             WHERE OrderID = ?
               AND SellerID = ?
+              AND OrderStatus = 'Pending'
+              AND DeliveryStatus IS NULL
             """,
             (next_status, next_delivery_status, order_id, session["user"]["seller_id"]),
         )
         rows_affected = cursor.rowcount
-        conn.commit()
 
         if rows_affected <= 0:
-            flash("Order not found for this seller.", "warn")
+            conn.rollback()
+            flash("Only this seller's pending orders can be confirmed or cancelled.", "warn")
         else:
+            cursor.execute(
+                """
+                INSERT INTO MessageLogs (OrderID, MessageContent)
+                VALUES (?, ?)
+                """,
+                (order_id, f"Seller changed order status to {next_status}."),
+            )
+            conn.commit()
             flash("Order action updated.", "success")
     except Exception as err:
+        if conn:
+            conn.rollback()
         app.logger.error("Order action update failed: %s", err)
         flash("Unable to update order action right now.", "error")
     finally:
@@ -904,15 +1191,20 @@ def update_order_action(order_id: int):
 @require_auth
 def update_order_status(order_id: int):
     status = str(request.form.get("status", "")).strip().lower()
-    status_map = {
-        "pending": "Pending",
-        "delivered": "Delivered",
-        "returned_by_buyer": "Returned by buyer",
-    }
+    status_map = {"delivered": "Delivered", "returned_by_buyer": "Returned by buyer"}
     next_delivery_status = status_map.get(status)
 
     if not next_delivery_status:
-        flash("Status must be pending, delivered, or returned_by_buyer.", "error")
+        flash("Status must be delivered or returned_by_buyer.", "error")
+        return redirect(url_for("dashboard", search=request.form.get("search", "")))
+
+    if session["user"].get("is_demo"):
+        updated = update_demo_order(
+            order_id,
+            session["user"]["seller_id"],
+            status=next_delivery_status,
+        )
+        flash("Demo delivery status updated." if updated else "Only confirmed demo orders awaiting delivery can be updated.", "success" if updated else "warn")
         return redirect(url_for("dashboard", search=request.form.get("search", "")))
 
     conn = None
@@ -931,13 +1223,23 @@ def update_order_status(order_id: int):
             (next_delivery_status, order_id, session["user"]["seller_id"]),
         )
         rows_affected = cursor.rowcount
-        conn.commit()
 
         if rows_affected <= 0:
+            conn.rollback()
             flash("Only confirmed orders with pending status can be updated.", "warn")
         else:
+            cursor.execute(
+                """
+                INSERT INTO MessageLogs (OrderID, MessageContent)
+                VALUES (?, ?)
+                """,
+                (order_id, f"Seller changed delivery status to {next_delivery_status}."),
+            )
+            conn.commit()
             flash("Delivery status updated.", "success")
     except Exception as err:
+        if conn:
+            conn.rollback()
         app.logger.error("Order delivery status update failed: %s", err)
         flash("Unable to update delivery status right now.", "error")
     finally:
@@ -963,19 +1265,15 @@ def submit_store_order():
         "total_amount": request.form.get("totalAmount", "0"),
     }
 
-    try:
-        total_amount = float(payload["total_amount"])
-    except (TypeError, ValueError):
-        total_amount = 0
-
-    if not payload["domain_name"] or not payload["buyer_name"] or not payload["phone"] or not payload["address"] or total_amount <= 0:
-        flash("Please enter valid domain, buyer name, phone, address, and amount.", "error")
+    payload["total_amount"] = parse_order_amount(payload["total_amount"])
+    validation_error = validate_order_payload(payload)
+    if validation_error:
+        flash(validation_error, "error")
         return render_template("store.html", domain_name=payload["domain_name"], form=payload)
 
-    payload["total_amount"] = total_amount
-
     try:
-        result = place_public_order(payload)
+        demo_domains = {user["domain_name"] for user in DEMO_USERS.values()}
+        result = place_demo_order(payload) if DEMO_MODE and payload["domain_name"] in demo_domains else place_public_order(payload)
         flash(
             f"Order #{result['seller_order_no']} placed for {result['business_name']}. Buyer ID: {result['seller_buyer_no']}.",
             "success",
@@ -1016,4 +1314,8 @@ def store_html_redirect():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=3000, debug=True)
+    app.run(
+        host=os.getenv("APP_HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "3000")),
+        debug=env_flag("FLASK_DEBUG", False),
+    )

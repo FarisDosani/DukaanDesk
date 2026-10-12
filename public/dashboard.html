@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Dashboard | PakkOrder</title>
+    <title>Dashboard | DukaanDesk</title>
     <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -18,6 +18,7 @@
                 <p id="identityLine">Signed in as {{ user.username }}{% if user.domain_name %} | Domain: {{ user.domain_name }}{% endif %}</p>
             </div>
             <form method="post" action="/logout">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                 <button id="logoutBtn" class="btn-secondary" type="submit">Logout</button>
             </form>
         </header>
@@ -104,6 +105,7 @@
                                     <td>
                                         {% if order.OrderStatus == 'Pending' %}
                                             <form method="post" action="/orders/{{ order.OrderID }}/action" class="table-inline-form">
+                                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                                                 <input type="hidden" name="search" value="{{ search }}" />
                                                 <select class="status-select" name="action" required>
                                                     <option value="">Select action</option>
@@ -121,9 +123,10 @@
                                     <td>
                                         {% if order.OrderStatus == 'Confirmed' and (order.DeliveryStatus or 'Pending') == 'Pending' %}
                                             <form method="post" action="/orders/{{ order.OrderID }}/status" class="table-inline-form">
+                                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                                                 <input type="hidden" name="search" value="{{ search }}" />
                                                 <select class="status-select" name="status" required>
-                                                    <option value="pending" selected>Pending</option>
+                                                    <option value="" selected>Select outcome</option>
                                                     <option value="delivered">Delivered</option>
                                                     <option value="returned_by_buyer">Returned by buyer</option>
                                                 </select>

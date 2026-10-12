@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Client Signup | PakkOrder</title>
+    <title>Client Signup | DukaanDesk</title>
     <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -24,36 +24,36 @@
                 <p class="panel-subtitle">Create your portal login with email, username, and password.</p>
 
                 <form id="signupForm" method="post" action="/signup">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                     <label for="businessName">Business Name</label>
-                    <input id="businessName" name="businessName" type="text" autocomplete="organization" value="{{ (form.business_name if form else '') }}" required />
+                    <input id="businessName" name="businessName" type="text" autocomplete="organization" maxlength="100" value="{{ (form.business_name if form else '') }}" required />
 
                     <label for="whatsappNumber">WhatsApp Number</label>
-                    <input id="whatsappNumber" name="whatsappNumber" type="text" placeholder="+923001112233" value="{{ (form.whatsapp_number if form else '') }}" required />
+                    <input id="whatsappNumber" name="whatsappNumber" type="text" inputmode="tel" maxlength="20" placeholder="+923001112233" value="{{ (form.whatsapp_number if form else '') }}" required />
                     <p class="field-hint">
-                        Use the same business name and same WhatsApp to create more client logins for one seller.
-                        A WhatsApp already linked to a different business will be rejected.
+                        Each WhatsApp number can onboard one seller. Additional employee access is not part of the current MVP.
                     </p>
 
                     <label for="email">Email</label>
-                    <input id="email" name="email" type="email" autocomplete="email" placeholder="owner@shop.com" value="{{ (form.email if form else '') }}" required />
+                    <input id="email" name="email" type="email" autocomplete="email" maxlength="255" placeholder="owner@shop.com" value="{{ (form.email if form else '') }}" required />
                     <p class="field-hint">
-                        This email must be unique for each seller profile.
+                        This email must be unique for each seller profile and is required at login.
                     </p>
 
                     <label for="domainName">Domain Name</label>
-                    <input id="domainName" name="domainName" type="text" placeholder="shopname.local" value="{{ (form.domain_name if form else '') }}" required />
+                    <input id="domainName" name="domainName" type="text" maxlength="120" pattern="[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?" placeholder="shopname.local" value="{{ (form.domain_name if form else '') }}" required />
                     <p class="field-hint">
                         Buyers place orders using this domain. Example local URL: /store/shopname.local
                     </p>
 
                     <label for="username">Username</label>
-                    <input id="username" name="username" type="text" autocomplete="username" value="{{ (form.username if form else '') }}" required />
+                    <input id="username" name="username" type="text" autocomplete="username" minlength="3" maxlength="100" pattern="[A-Za-z0-9._-]+" value="{{ (form.username if form else '') }}" required />
 
                     <label for="password">Password</label>
-                    <input id="password" name="password" type="password" autocomplete="new-password" required />
+                    <input id="password" name="password" type="password" autocomplete="new-password" minlength="10" maxlength="128" required />
 
                     <label for="confirmPassword">Confirm Password</label>
-                    <input id="confirmPassword" name="confirmPassword" type="password" autocomplete="new-password" required />
+                    <input id="confirmPassword" name="confirmPassword" type="password" autocomplete="new-password" minlength="10" maxlength="128" required />
 
                     <button id="signupBtn" class="btn-primary" type="submit">Create account</button>
                     {% with messages = get_flashed_messages(with_categories=true) %}
