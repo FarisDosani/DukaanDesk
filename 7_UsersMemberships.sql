@@ -68,8 +68,12 @@ BEGIN TRY
     -- Refuse a drifted/incompatible schema rather than silently trusting weak constraints.
     IF (SELECT COUNT(*) FROM sys.key_constraints WHERE
         (parent_object_id = OBJECT_ID('dbo.Users') AND name IN
-         ('PK_Users','UQ_Users_LegacyClientUser','UQ_Users_Username','UQ_Users_NormalizedEmail'))
-        OR (parent_object_id = OBJECT_ID('dbo.OrganizationMemberships') AND name = 'PK_OrganizationMemberships')) <> 5
+         ('PK_Users','UQ_Users_Username','UQ_Users_NormalizedEmail'))
+        OR (parent_object_id = OBJECT_ID('dbo.OrganizationMemberships') AND name = 'PK_OrganizationMemberships')) <> 4
+        OR NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.Users')
+            AND is_unique=1 AND is_disabled=0 AND
+            (name='UQ_Users_LegacyClientUser' OR (name='UX_Users_LegacyClientUser'
+             AND has_filter=1 AND filter_definition='([LegacyClientUserID] IS NOT NULL)')))
         OR (SELECT COUNT(*) FROM sys.foreign_keys WHERE name IN
             ('FK_Users_ClientUsers','FK_Memberships_Users','FK_Memberships_Organizations')
             AND is_disabled = 0 AND is_not_trusted = 0) <> 3

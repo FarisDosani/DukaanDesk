@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" /><title>Accept invitation | DukaanDesk</title>
+<link rel="stylesheet" href="/static/styles.css" /></head><body><main class="page-shell"><section class="surface orders">
+<h1>Join your organization</h1>
+{% if notice %}<p role="status">{{ notice }}</p>{% endif %}
+<p>An invitation link alone does not verify your email. Already have an account? <a href="/login">Sign in</a> with the invited email first, then reopen your invitation.</p>
+<form method="post" action="/invitations/accept" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+    <label>Invitation token <input id="invitation-token" name="token" value="{{ token or '' }}" required maxlength="43" /></label>
+    <p>Every recipient must request a separate code at the invited mailbox. If email delivery is unavailable, acceptance is blocked. A new code invalidates the previous code.</p>
+    <button class="btn-secondary" type="submit" name="action" value="verify">Email verification code</button>
+    <label>Emailed verification code <input name="verification" maxlength="43" autocomplete="off" /></label>
+    <p><button class="btn-primary" type="submit" name="action" value="accept">Verify email and accept as signed-in user</button></p>
+    <h2>New employee account</h2>
+    <label>Username <input name="username" maxlength="100" autocomplete="username" /></label>
+    <label>Password (10–128 characters) <input type="password" name="password" maxlength="128" autocomplete="new-password" /></label>
+    <label>Confirm password <input type="password" name="confirm_password" maxlength="128" autocomplete="new-password" /></label>
+    <button class="btn-primary" type="submit" name="action" value="register">Verify email and join</button>
+</form>
+</section></main>
+<script>
+    const token = new URLSearchParams(window.location.hash.slice(1)).get('token');
+    if (token) document.getElementById('invitation-token').value = token;
+    if (window.location.hash) history.replaceState(null, '', window.location.pathname);
+</script>
+</body></html>

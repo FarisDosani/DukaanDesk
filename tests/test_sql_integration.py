@@ -1,6 +1,8 @@
 import os
 import unittest
 import uuid
+import re
+from unittest.mock import patch
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -33,6 +35,9 @@ class SQLIntegrationTests(unittest.TestCase):
                 columns = 'UserID, OrganizationID, Status, CreatedAt' if table == 'OrganizationMemberships' else '*'
                 cls.original_identity_rows[table] = {tuple(row) for row in cls.connection.cursor().execute(f"SELECT {columns} FROM dbo.{table}").fetchall()}
         cls.original_roles = set()
+        cls.original_invitations = set()
+        if cls.connection.cursor().execute("SELECT OBJECT_ID('dbo.OrganizationInvitations','U')").fetchone()[0]:
+            cls.original_invitations = {tuple(row) for row in cls.connection.cursor().execute('SELECT * FROM OrganizationInvitations').fetchall()}
         if cls.connection.cursor().execute("SELECT COL_LENGTH('dbo.OrganizationMemberships','RoleName')").fetchone()[0]:
             cls.original_roles = {tuple(row) for row in cls.connection.cursor().execute('SELECT UserID,OrganizationID,RoleName FROM OrganizationMemberships').fetchall()}
 
@@ -50,6 +55,10 @@ class SQLIntegrationTests(unittest.TestCase):
             current_roles = {tuple(row) for row in cls.connection.cursor().execute('SELECT UserID,OrganizationID,RoleName FROM OrganizationMemberships').fetchall()}
             if not cls.original_roles.issubset(current_roles):
                 raise AssertionError('Pre-existing role assignments changed')
+            if cls.original_invitations:
+                invitations = {tuple(row) for row in cls.connection.cursor().execute('SELECT * FROM OrganizationInvitations').fetchall()}
+                if not cls.original_invitations.issubset(invitations):
+                    raise AssertionError('Pre-existing invitations changed')
         finally:
             cls.connection.close()
 
@@ -180,6 +189,222 @@ class SQLIntegrationTests(unittest.TestCase):
             self.connection.rollback()
         self.assertTrue(before == self.snapshot_legacy())
         self.assertEqual(user_count, self.query_one("SELECT COUNT(*) FROM Users")[0])
+
+    def test_00d_invitation_migration_preserves_rows_and_is_idempotent(self):
+        self.assertEqual(self.query_one('SELECT DB_NAME()')[0], 'DukaanDesk_Test')
+        sql = (Path(__file__).parents[1] / '9_OrganizationInvitations.sql').read_text(encoding='utf-8')
+        before = self.snapshot_legacy()
+        users = {tuple(row) for row in self.connection.cursor().execute('SELECT * FROM Users').fetchall()}
+        members = {tuple(row) for row in self.connection.cursor().execute('SELECT * FROM OrganizationMemberships').fetchall()}
+        for _ in range(2):
+            self.connection.cursor().execute(sql)
+            self.connection.commit()
+            self.assertTrue(before == self.snapshot_legacy())
+            self.assertTrue(users == {tuple(row) for row in self.connection.cursor().execute('SELECT * FROM Users').fetchall()})
+            self.assertTrue(members == {tuple(row) for row in self.connection.cursor().execute('SELECT * FROM OrganizationMemberships').fetchall()})
+        self.assertEqual(self.query_one("SELECT is_nullable FROM sys.columns WHERE object_id=OBJECT_ID('dbo.Users') AND name='LegacyClientUserID'")[0], 1)
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM sys.foreign_keys WHERE parent_object_id=OBJECT_ID('dbo.OrganizationInvitations') AND is_disabled=0 AND is_not_trusted=0")[0],4)
+        self.apply_identity_migration()  # Earlier migration stays compatible, no employee imports/merges.
+
+    def invitation_post(self, client, path, **data):
+        with client.session_transaction() as state:
+            csrf = state.get('csrf_token')
+        if not csrf:
+            csrf = self.csrf(client, '/invitations/accept')
+        return client.post(path, data={'csrf_token':csrf, **data})
+
+    def invite(self, owner, email, role='Support'):
+        with patch.dict(os.environ, {'APP_ENV':'development','DEV_INVITATION_LINKS':'true'}):
+            response = self.invitation_post(owner, '/organization/invitations', email=email, role=role)
+        self.assertEqual(response.status_code,201)
+        match = re.search(rb'#token=([A-Za-z0-9_-]{43})',response.data)
+        self.assertTrue(match is not None, 'Development invitation link missing')
+        token = match[1].decode()
+        row = self.query_one('SELECT InvitationID,TokenHash,Status FROM OrganizationInvitations WHERE TokenHash=?', (dukaan.invitation_digest(token),))
+        self.assertTrue(row is not None)
+        self.assertTrue(row.TokenHash != token)
+        return token, str(row.InvitationID)
+
+    def another_identity(self, suffix):
+        return {**self.identity, 'username':self.identity['username']+suffix,
+                'email':suffix+self.identity['email'], 'phone':self.identity['phone']+suffix,
+                'domain':suffix+self.identity['domain']}
+
+    def invitation_verification(self, client, token):
+        with patch.object(dukaan,'send_invitation_email') as mail:
+            self.assertEqual(self.invitation_post(client,'/invitations/accept',action='verify',token=token).status_code,200)
+            return mail.call_args.args[2].splitlines()[1]
+
+    def test_invitations_existing_accept_replay_email_and_tenant_guards(self):
+        owner = self.signup(self.identity)
+        recipient_identity = self.another_identity('2')
+        recipient = self.signup(recipient_identity)
+        token, iid = self.invite(owner, recipient_identity['email'], 'Operations')
+        self.assertEqual(self.invitation_post(recipient,'/invitations/accept',action='accept',token=token).status_code,403)
+        code = self.invitation_verification(recipient,token)
+        # Logged-in inviter is not the invited identity; client tenant claims do not help.
+        response = self.invitation_post(owner,'/invitations/accept',action='accept',token=token,verification=code,email=recipient_identity['email'])
+        self.assertEqual(response.status_code,403)
+        self.assertEqual(self.invitation_post(recipient,f'/organization/invitations/{iid}/revoke').status_code,404)
+        self.assertEqual(self.invitation_post(recipient,'/invitations/accept',action='accept',token=token,verification=code).status_code,302)
+        self.assertEqual(self.invitation_post(recipient,'/invitations/accept',action='accept',token=token).status_code,410)
+        with owner.session_transaction() as state:
+            org = state['user']['organization_id']
+        with recipient.session_transaction() as state:
+            uid = state['user']['global_user_id']
+        self.assertEqual(self.query_one('SELECT RoleName FROM OrganizationMemberships WHERE UserID=? AND OrganizationID=?',(uid,org))[0],'Operations')
+        self.assertEqual(self.invitation_post(recipient,'/organizations/switch',organization_id=org).status_code,302)
+        self.assertEqual(recipient.get('/dashboard').status_code,200)
+        self.assertEqual(self.invitation_post(recipient,'/organization/invitations',email='other@example.test',role='Admin').status_code,403)
+        self.assertEqual(self.invitation_post(owner,'/organization/invitations',email=recipient_identity['email'],role='Admin').status_code,409)
+        self.assertEqual(self.invitation_post(owner,f'/organization/members/{uid}/deactivate').status_code,302)
+        self.assertEqual(recipient.get('/dashboard').status_code,302)
+        self.assertEqual(self.invitation_post(owner,'/organization/invitations',email=recipient_identity['email'],role='Admin').status_code,409)
+
+    def test_invitations_new_employee_requires_separate_mail_and_can_login(self):
+        owner = self.signup(self.identity)
+        for suffix in ('a','b'):  # SQL Server filtered uniqueness permits several NULL legacy links.
+            email = suffix+self.identity['email']
+            username = suffix+self.identity['username']
+            token, iid = self.invite(owner,email,'Finance')
+            employee = dukaan.app.test_client()
+            data = dict(action='register',token=token,username=username,password=self.identity['password'],confirm_password=self.identity['password'])
+            self.assertEqual(self.invitation_post(employee,'/invitations/accept',**data).status_code,403)
+            with patch.object(dukaan,'send_invitation_email',side_effect=RuntimeError('not configured')):
+                self.assertEqual(self.invitation_post(employee,'/invitations/accept',action='verify',token=token).status_code,503)
+            with patch.object(dukaan,'send_invitation_email') as mail:
+                self.assertEqual(self.invitation_post(employee,'/invitations/accept',action='verify',token=token).status_code,200)
+                self.assertEqual(mail.call_args.args[0],email)
+                code = mail.call_args.args[2].splitlines()[1]
+            self.assertTrue(code != token)
+            self.assertEqual(self.invitation_post(employee,'/invitations/accept',action='verify',token=token).status_code,429)
+            self.assertEqual(self.invitation_post(employee,'/invitations/accept',**data,verification=token).status_code,403)
+            self.assertEqual(self.invitation_post(employee,'/invitations/accept',**data,verification=code).status_code,302)
+            self.assertEqual(self.invitation_post(employee,'/invitations/accept',**data,verification=code).status_code,410)
+            row = self.query_one('SELECT LegacyClientUserID,PasswordHash FROM Users WHERE NormalizedEmail=?',(email,))
+            self.assertIsNone(row.LegacyClientUserID)
+            self.assertTrue(dukaan.check_password_hash(row.PasswordHash,self.identity['password']))
+            self.assertIsNone(self.query_one('SELECT VerificationHash FROM OrganizationInvitations WHERE InvitationID=?',(iid,))[0])
+            client, response = self.login({**self.identity,'email':email,'username':username})
+            self.assertEqual(response.status_code,302)
+            self.assertEqual(client.get('/dashboard').status_code,200)
+            self.assertEqual(client.get('/summary').status_code,200)
+            self.assertEqual(client.get('/organization/members').status_code,403)
+            self.assertEqual(self.invitation_post(client,'/organization/invitations',email='bad@example.test',role='Owner').status_code,403)
+            self.apply_identity_migration()
+
+    def test_invitations_expiry_revocation_duplicate_pending_and_last_owner(self):
+        owner = self.signup(self.identity)
+        with owner.session_transaction() as state:
+            uid = state['user']['global_user_id']
+        self.assertEqual(self.invitation_post(owner,f'/organization/members/{uid}/deactivate').status_code,409)
+        self.assertEqual(self.invitation_post(owner,'/organization/invitations',email='person@example.test',role='Owner').status_code,400)
+        recipient = dukaan.app.test_client()
+        for status in ('Expired','Revoked'):
+            email = status.lower()+self.identity['email']
+            token, iid = self.invite(owner,email)
+            self.assertEqual(self.invitation_post(owner,'/organization/invitations',email=email,role='Support').status_code,409)
+            if status == 'Revoked':
+                self.assertEqual(self.invitation_post(owner,f'/organization/invitations/{iid}/revoke').status_code,302)
+            else:
+                self.connection.cursor().execute("UPDATE OrganizationInvitations SET CreatedAt=DATEADD(day,-3,SYSUTCDATETIME()),ExpiresAt=DATEADD(day,-1,SYSUTCDATETIME()) WHERE InvitationID=?",(iid,))
+                self.connection.commit()
+            self.assertEqual(self.invitation_post(recipient,'/invitations/accept',action='verify',token=token).status_code,410)
+            self.assertEqual(self.query_one('SELECT Status FROM OrganizationInvitations WHERE InvitationID=?',(iid,))[0],status)
+        page = owner.get('/organization/members')
+        self.assertEqual(page.status_code,200)
+        self.assertIn(b'Invite an employee',page.data)
+        self.assertNotIn(token.encode(),page.data)
+
+    def test_invitations_all_nonowners_denied_and_issuer_revocation(self):
+        owner = self.signup(self.identity)
+        admin = self.signup(self.another_identity('2'))
+        with owner.session_transaction() as state:
+            uid, org = state['user']['global_user_id'],state['user']['organization_id']
+        with admin.session_transaction() as state:
+            other_uid = state['user']['global_user_id']
+        self.connection.cursor().execute("INSERT OrganizationMemberships (UserID,OrganizationID,Status,RoleName) VALUES (?,?,'Active','Owner')",(other_uid,org))
+        self.connection.commit()
+        token,iid = self.invite(owner,'new'+self.identity['email'])
+        for role in ('Admin','Operations','Finance','Marketing','Support',None):
+            self.connection.cursor().execute('UPDATE OrganizationMemberships SET RoleName=? WHERE UserID=? AND OrganizationID=?',(role,uid,org))
+            self.connection.commit()
+            for path, data in [('/organization/invitations',dict(email='next@example.test',role='Support')),
+                (f'/organization/invitations/{iid}/revoke',{}),(f'/organization/members/{other_uid}/deactivate',{})]:
+                with self.subTest(role=role,path=path):
+                    self.assertEqual(self.invitation_post(owner,path,**data).status_code,403)
+        recipient=dukaan.app.test_client()
+        self.assertEqual(self.invitation_post(recipient,'/invitations/accept',action='verify',token=token).status_code,403)
+        self.assertEqual(self.query_one('SELECT Status FROM OrganizationInvitations WHERE InvitationID=?',(iid,))[0],'Pending')
+
+    def test_invitations_production_delivery_rollback_and_no_token_response(self):
+        owner = self.signup(self.identity)
+        email='new'+self.identity['email']
+        with patch.dict(os.environ, {'APP_ENV':'production','DEV_INVITATION_LINKS':'true','APP_PUBLIC_URL':'https://app.example.test'}):
+            with patch.object(dukaan,'send_invitation_email',side_effect=RuntimeError('mail unavailable')):
+                response=self.invitation_post(owner,'/organization/invitations',email=email,role='Support')
+                self.assertEqual(response.status_code,503)
+                self.assertEqual(self.query_one('SELECT COUNT(*) FROM OrganizationInvitations WHERE Email=?',(email,))[0],0)
+            with patch.object(dukaan,'send_invitation_email') as mail:
+                response=self.invitation_post(owner,'/organization/invitations',email=email,role='Support')
+                self.assertEqual(response.status_code,302)
+                token=re.search(r'#token=([A-Za-z0-9_-]{43})',mail.call_args.args[2])[1]
+                self.assertNotIn(token.encode(),response.data)
+                self.assertEqual(mail.call_args.args[0],email)
+
+    def test_invitations_concurrent_acceptance_and_duplicate_membership(self):
+        owner = self.signup(self.identity)
+        identity = self.another_identity('2')
+        recipient = self.signup(identity)
+        second, response = self.login(identity)
+        self.assertEqual(response.status_code,302)
+        token, iid = self.invite(owner,identity['email'])
+        code = self.invitation_verification(recipient,token)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda client: self.invitation_post(client,'/invitations/accept',action='accept',token=token,verification=code).status_code,
+                                        (recipient,second)))
+        self.assertEqual(sorted(results),[302,410])
+        with owner.session_transaction() as state:
+            org = state['user']['organization_id']
+        with recipient.session_transaction() as state:
+            uid = state['user']['global_user_id']
+        self.assertEqual(self.query_one('SELECT COUNT(*) FROM OrganizationMemberships WHERE UserID=? AND OrganizationID=?',(uid,org))[0],1)
+        third_identity = self.another_identity('3')
+        third = self.signup(third_identity)
+        with third.session_transaction() as state:
+            third_uid = state['user']['global_user_id']
+        self.assertEqual(self.invitation_post(owner,f'/organization/members/{third_uid}/deactivate').status_code,404)
+        token, iid = self.invite(owner,third_identity['email'],'Admin')
+        self.connection.cursor().execute("INSERT OrganizationMemberships (UserID,OrganizationID,Status,RoleName) VALUES (?,?,'Inactive','Support')",(third_uid,org))
+        self.connection.commit()
+        self.assertEqual(self.invitation_post(third,'/invitations/accept',action='accept',token=token).status_code,409)
+        self.assertEqual(tuple(self.query_one('SELECT Status,RoleName FROM OrganizationMemberships WHERE UserID=? AND OrganizationID=?',(third_uid,org))),('Inactive','Support'))
+
+    def test_invitations_verification_expiry_and_employee_lockout(self):
+        owner = self.signup(self.identity)
+        email='new'+self.identity['email']
+        username='new'+self.identity['username']
+        token,iid = self.invite(owner,email)
+        recipient=dukaan.app.test_client()
+        with patch.object(dukaan,'send_invitation_email') as mail:
+            self.assertEqual(self.invitation_post(recipient,'/invitations/accept',action='verify',token=token).status_code,200)
+            code=mail.call_args.args[2].splitlines()[1]
+        self.connection.cursor().execute("UPDATE OrganizationInvitations SET VerificationExpiresAt=DATEADD(second,-1,SYSUTCDATETIME()),VerificationSentAt=DATEADD(minute,-2,SYSUTCDATETIME()) WHERE InvitationID=?",(iid,))
+        self.connection.commit()
+        data=dict(action='register',token=token,username=username,password=self.identity['password'],confirm_password=self.identity['password'])
+        self.assertEqual(self.invitation_post(recipient,'/invitations/accept',**data,verification=code).status_code,403)
+        with patch.object(dukaan,'send_invitation_email') as mail:
+            self.assertEqual(self.invitation_post(recipient,'/invitations/accept',action='verify',token=token).status_code,200)
+            replacement=mail.call_args.args[2].splitlines()[1]
+        self.assertEqual(self.invitation_post(recipient,'/invitations/accept',**data,verification=code).status_code,403)
+        self.assertEqual(self.invitation_post(recipient,'/invitations/accept',**data,verification=replacement).status_code,302)
+        identity={**self.identity,'email':email,'username':username}
+        employee,response=self.login(identity)
+        self.assertEqual(response.status_code,302)
+        for _ in range(3):
+            self.login(identity,password='incorrect-password')
+        self.assertEqual(self.query_one('SELECT IsLocked FROM Users WHERE NormalizedEmail=?',(email,))[0],True)
+        self.assertEqual(employee.get('/dashboard').status_code,302)
 
     def setUp(self):
         token = uuid.uuid4().hex[:12]

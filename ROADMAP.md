@@ -6,7 +6,7 @@ Last updated: 2026-10-12
 
 DukaanDesk should evolve from the current single-domain COD operations MVP into a multi-tenant B2B SaaS for businesses that already sell through Shopify, WooCommerce, or custom websites. A business should eventually connect multiple stores, assign employees role-based access, consolidate orders and analytics, and manage a subscription. A platform super admin should manage tenant onboarding, plans, service health, and support operations.
 
-Phase 2.1 added organization IDs; Phase 2.2 added global users, memberships, and switching; Phase 2.3 adds six organization-scoped roles, explicit SQL permissions, and Owner-only role assignment. Multi-store, invitations, super-admin, and subscriptions remain unimplemented.
+Phase 2.1 added organization IDs; Phase 2.2 added global users, memberships, and switching; Phase 2.3 added six organization-scoped roles and explicit SQL permissions; Phase 2.4 adds Owner-managed employee invitations, mailbox-verified acceptance, and membership deactivation. Multi-store, super-admin, and subscriptions remain unimplemented.
 
 ## Completed in the current MVP hardening pass
 
@@ -36,18 +36,21 @@ Phase 2.1 added organization IDs; Phase 2.2 added global users, memberships, and
 - Added migration 7 with transactional backfill, duplicate-email ambiguity rejection, idempotence, and no membership reactivation on rerun.
 - Revalidate memberships and user activity/lockout on every protected request and in protected order SQL; provide a minimal CSRF-protected organization selector.
 - Phase 2.3: SQL role assignments and explicit grants, conservative founder backfill, deny-by-default route/query guards, role-aware navigation, roster access, and Owner-only role assignment with last-owner protection.
+- Phase 2.4: hashed single-use invitations, separate SMTP mailbox verification, secure employee registration without legacy seller accounts, authenticated existing-user acceptance, non-Owner invitation roles, revocation/expiry, and tenant-scoped membership deactivation with last-Owner protection.
 
 The original hardening and Phase 2.1/2.2 work have been verified against the disposable SQL Server database described below. This does not establish production readiness.
 
 ## Verification checkpoint — 2026-10-12
 
-- Offline verification: 23 tests pass with 66 subtests; ten guarded SQL tests require explicit opt-in.
-- SQL verification: the full suite reports 33 passed and 72 subtests against confirmed disposable `DukaanDesk_Test` on `localhost\MSSQLSERVER01`. No test failures occurred.
+- Current offline verification: 29 tests pass with 77 subtests; eighteen guarded SQL tests require explicit opt-in.
+- Current SQL verification: the full suite reports 47 passed and 101 subtests against confirmed disposable `DukaanDesk_Test` on `localhost\MSSQLSERVER01`. One obsolete offline query-shape assertion initially failed and was corrected; no SQL failures occurred.
 - Signup, password hashing, hashed login, legacy-plaintext upgrade, lockout, order creation, confirmation/cancellation, delivery, tenant isolation, exact message logs, summaries, and concurrent seller-relative numbering were exercised against real SQL Server.
 - Read-only migration preflight found no invalid or cross-seller rows. The organization migration backfilled all 18 existing sellers without changing legacy row fingerprints, and a second run inserted zero rows. Seed and reset scripts were not run; `CODManager` remained absent.
 - **Phase 2.1 organization foundation is complete.** The additive migration preserved the original synthetic dataset, backfilled every seller, and passed idempotence, immutability, mapping, and cross-organization tests.
 - **Phase 2.2 global users/memberships are complete within scope.** Migration imported all 22 initial accounts without ambiguous emails; full original row comparisons passed. SQL tests verify exact locked-account backfill, ambiguity rollback, switching, legacy-session upgrade, inactive/revoked access denial, and rerun preservation. No membership provisioning, invitations, or roles were added.
 - **Phase 2.3 RBAC is complete within scope.** Migration assigned 42 verified sole-account founders as Owner, leaving three additional memberships unassigned. All six roles, direct unauthorized actions, role changes, roleless denial, tenant isolation, last-owner protection, policy drift rejection, and idempotence passed. Pre-existing data was preserved. Durable role-change audits and owner recovery remain required before broader administration/launch.
+- **Phase 2.4 employee invitations are implemented and SQL-verified.** Migration 9 creates invitations and optional legacy identity links without changing pre-existing values; migration 7 remains compatible. Verification covers replay/concurrent acceptance, expiry, separate mailbox proof, identity mismatch, every non-Owner denial, cross-tenant targets, revocation, duplicates, deactivation, last-Owner safety, employee login/lockout, and delivery-failure rollback. All pre-existing data survived. Final disposable counts and exact commands are in README/PROJECT_CONTEXT.
+- **Email delivery remains a launch blocker.** SMTP was mocked in tests and is not configured locally. Development-only links allow creation/inspection/revocation, but never bypass separate email proof for acceptance. External mail delivery and browser visual QA still need verification.
 
 ## P0 — required before any real launch
 
@@ -62,7 +65,8 @@ The original hardening and Phase 2.1/2.2 work have been verified against the dis
    - Invalidate old sessions after password/account changes.
 
 3. **Add account recovery and identity controls**
-   - Verified email ownership, expiring single-use reset tokens, secure account unlock, and password change.
+   - Invitation-specific mailbox verification is implemented. Still needed: general business-account email verification, expiring single-use reset tokens, secure account unlock, and password change.
+   - Configure/test SMTP with real mailboxes, add account/IP/invitation-send quotas and durable mail retries/outbox, and review identity recovery for users with no active organization. Local development links never bypass mailbox verification.
    - Rate limiting by account and IP; audit authentication events.
    - Decide whether MFA is mandatory for owners/admins.
 
@@ -104,9 +108,9 @@ Continue this as a versioned migration and service-boundary project. Keep `Selle
 2. **Users, memberships, and RBAC**
    - Completed in Phase 2.2: global Users and OrganizationMemberships, active membership checks, server-authorized organization switching, and legacy login compatibility.
    - Completed in Phase 2.3: Owner/Admin/Operations/Finance/Marketing/Support assignments, explicit SQL grants, immediate request-time role revalidation, roster viewing, Owner-only role changes, and last-owner protection.
-   - Next: durable role-change audit records, finer field-level privacy, and verified owner recovery before employee invitations/membership administration. Every current dashboard viewer sees existing contact data and KPIs.
-   - Remove the mandatory legacy account dependency only through a separately designed migration; do not merge accounts automatically by email.
-   - Owner-managed invitations with expiry and revocation.
+   - Completed in Phase 2.4: Owner-managed invitations with 48-hour expiry/revocation, separate 15-minute mailbox proof for every recipient, existing-user acceptance/new registration, and membership deactivation. No automatic membership reactivation or identity merging.
+   - Completed in Phase 2.4: migration 9 makes legacy identity links optional for employees while retaining immutable unique existing mappings; migration 7 remains rerunnable.
+   - Next: real SMTP delivery verification, durable role/invitation/deactivation audit events, rate limits, finer field-level privacy, and verified owner/account recovery. Every current dashboard viewer sees existing contact data and KPIs.
    - Review the six-role permission matrix with product requirements before expanding capabilities; custom roles are not supported.
    - Store-scoped assignments where needed; deny by default and test every permission boundary.
 
@@ -141,7 +145,7 @@ Continue this as a versioned migration and service-boundary project. Keep `Selle
 ## Deferred/non-goals for the present pass
 
 - No Shopify, WooCommerce, or custom-store integration.
-- No employee invitation or self-service membership creation.
+- No open self-service membership attachment or inactive/revoked membership reactivation; Owner-invited acceptance is implemented.
 - No platform super-admin UI or API.
 - No subscription/billing implementation.
 - No framework rewrite, SPA conversion, microservices split, or queue introduction.

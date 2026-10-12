@@ -346,8 +346,8 @@ class DukaanDeskTests(unittest.TestCase):
                 dukaan.session["user"]["organization_id"], self.TEST_ORGANIZATION_ID
             )
         query = connection.cursor_instance.executions[0]
-        self.assertIn("WHERE U.LegacyClientUserID = ?", query[0])
-        self.assertEqual(query[1], (7,))
+        self.assertIn("? IS NULL AND U.LegacyClientUserID = ?", query[0])
+        self.assertEqual(query[1], (None, None, None, 7))
         self.assertTrue(connection.closed)
 
     def test_organization_migration_is_additive_and_backfills_sellers(self):

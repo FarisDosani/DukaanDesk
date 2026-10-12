@@ -1,7 +1,12 @@
+import hashlib
 import hmac
 import os
 import re
 import secrets
+import smtplib
+import ssl
+from email.message import EmailMessage
+from urllib.parse import urlsplit
 from copy import deepcopy
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -254,8 +259,10 @@ def add_security_headers(response):
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     if request.is_secure:
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-    if session.get("user"):
+    if session.get("user") or request.path.startswith('/invitations'):
         response.headers.setdefault("Cache-Control", "no-store")
+    if request.path.startswith('/invitations'):
+        response.headers['Referrer-Policy'] = 'no-referrer'
     return response
 
 
@@ -362,11 +369,13 @@ def resolve_legacy_organization_context() -> bool:
             JOIN OrganizationMemberships M ON M.UserID = U.UserID AND M.Status = 'Active'
             JOIN Organizations Org ON Org.OrganizationID = M.OrganizationID
             JOIN Sellers S ON S.SellerID = Org.LegacySellerID
-            WHERE U.LegacyClientUserID = ? AND U.IsActive = 1
+            WHERE ((? IS NOT NULL AND U.UserID = ?) OR
+                   (? IS NULL AND U.LegacyClientUserID = ?)) AND U.IsActive = 1
               AND U.IsLocked = 0 AND U.FailedAttempts < 3
             ORDER BY S.SellerID
             """,
-            (user.get("id"),),
+            (user.get("global_user_id"), user.get("global_user_id"),
+             user.get("global_user_id"), user.get("id")),
         ).fetchall()
         memberships = [user_from_membership(row) for row in rows]
         g.organization_memberships = memberships
@@ -377,6 +386,8 @@ def resolve_legacy_organization_context() -> bool:
         if not selected:
             return False
         if user.get("global_user_id") is not None and user["global_user_id"] != selected["global_user_id"]:
+            return False
+        if user.get("id") != selected["id"]:
             return False
         # Never cache authority in the signed cookie: roles/grants are read each request.
         g.permissions = frozenset(row[0] for row in conn.cursor().execute(
@@ -396,7 +407,7 @@ def resolve_legacy_organization_context() -> bool:
 
 def user_from_membership(row) -> dict:
     return {
-        "id": int(row.UserID), "global_user_id": int(row.GlobalUserID),
+        "id": int(row.UserID) if row.UserID is not None else None, "global_user_id": int(row.GlobalUserID),
         "email": row.Email, "username": row.Username,
         "seller_id": int(row.SellerID), "organization_id": str(row.OrganizationID),
         "business_name": row.BusinessName, "domain_name": row.DomainName,
@@ -433,7 +444,7 @@ def login_with_database(email: str, username: str, password: str) -> dict:
                 S.DomainName,
                 Org.OrganizationID, M.RoleName
             FROM Users U WITH (UPDLOCK, HOLDLOCK)
-            JOIN ClientUsers CU ON CU.UserID = U.LegacyClientUserID
+            LEFT JOIN ClientUsers CU ON CU.UserID = U.LegacyClientUserID
             JOIN OrganizationMemberships M ON M.UserID = U.UserID AND M.Status = 'Active'
             JOIN Organizations Org ON Org.OrganizationID = M.OrganizationID
             JOIN Sellers S ON S.SellerID = Org.LegacySellerID
@@ -1335,7 +1346,16 @@ def organization_members():
             (user["organization_id"], user["global_user_id"]),
         ).fetchall()
         roles = [row[0] for row in cursor.execute("SELECT RoleName FROM Roles ORDER BY RoleName").fetchall()]
-        return render_template("members.html", user=user, members=rows, roles=roles)
+        invitations = []
+        if g.role_name == 'Owner' and has_permission('members.roles'):
+            lock_organization_owner(cursor, user['organization_id'], user['global_user_id'])
+            invitations = cursor.execute("""SELECT InvitationID, Email, RoleName, ExpiresAt,
+                CASE WHEN Status='Pending' AND ExpiresAt<=SYSUTCDATETIME() THEN 'Expired'
+                     ELSE Status END AS Status FROM OrganizationInvitations
+                WHERE OrganizationID=? ORDER BY CreatedAt DESC""", (user['organization_id'],)).fetchall()
+        return render_template("members.html", user=user, members=rows, roles=roles,
+                               invitations=invitations, invite_roles=INVITABLE_ROLES,
+                               invitation_development=development_invitation_delivery())
     finally:
         conn.close()
 
@@ -1391,6 +1411,260 @@ def change_member_role(member_id: int):
     finally:
         conn.close()
     return redirect(url_for("organization_members"))
+
+
+INVITABLE_ROLES = ('Admin', 'Operations', 'Finance', 'Marketing', 'Support')
+
+
+def invitation_digest(value: str) -> str:
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+
+def development_invitation_delivery() -> bool:
+    # An explicit local-only escape hatch, never inferred from mail failure or demo.
+    return (os.getenv('APP_ENV') == 'development' and env_flag('DEV_INVITATION_LINKS')
+            and request.remote_addr in {'127.0.0.1', '::1'})
+
+
+def send_invitation_email(recipient: str, subject: str, body: str):
+    """SMTP with mandatory verified STARTTLS. Never log message bodies or errors."""
+    host, sender = os.getenv('SMTP_HOST'), os.getenv('SMTP_FROM')
+    if not host or not sender:
+        raise RuntimeError('Email delivery is not configured')
+    message = EmailMessage()
+    message['From'], message['To'], message['Subject'] = sender, recipient, subject
+    message.set_content(body)
+    with smtplib.SMTP(host, env_int('SMTP_PORT', 587, 1, 65535), timeout=10) as smtp:
+        smtp.starttls(context=ssl.create_default_context())
+        if os.getenv('SMTP_USERNAME'):
+            smtp.login(os.environ['SMTP_USERNAME'], os.getenv('SMTP_PASSWORD', ''))
+        smtp.send_message(message)
+
+
+def invitation_link(token: str) -> str:
+    origin = os.getenv('APP_PUBLIC_URL', '').rstrip('/')
+    parts = urlsplit(origin)
+    if parts.scheme != 'https' or not parts.netloc or parts.username or parts.password or parts.query or parts.fragment or parts.path:
+        raise ValueError('APP_PUBLIC_URL must be a fixed HTTPS origin')
+    # Fragment never reaches access logs or the Referer header. The accept page
+    # moves it to a POST field and clears browser history before any submission.
+    return origin + url_for('accept_invitation') + '#token=' + token
+
+
+def lock_organization_owner(cursor, organization_id, user_id):
+    cursor.execute('SELECT OrganizationID FROM Organizations WITH (UPDLOCK,HOLDLOCK) WHERE OrganizationID=?',
+                   (organization_id,)).fetchone()
+    owner = cursor.execute("""SELECT M.UserID FROM OrganizationMemberships M WITH (UPDLOCK,HOLDLOCK)
+        JOIN Users U WITH (UPDLOCK,HOLDLOCK) ON U.UserID=M.UserID
+        JOIN RolePermissions RP WITH (HOLDLOCK) ON RP.RoleName=M.RoleName
+        WHERE M.OrganizationID=? AND M.UserID=? AND M.Status='Active' AND M.RoleName='Owner'
+          AND U.IsActive=1 AND U.IsLocked=0 AND U.FailedAttempts<3 AND RP.Permission='members.roles'""",
+        (organization_id, user_id)).fetchone()
+    if not owner:
+        abort(403, description='An active Owner is required.')
+
+
+@app.post('/organization/invitations')
+@require_permission('members.roles')
+def create_invitation():
+    email = request.form.get('email', '').strip().lower()
+    role = request.form.get('role', '')
+    if not re.fullmatch(r'[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+', email) or len(email)>255 or role not in INVITABLE_ROLES:
+        abort(400, description='Enter a valid email and a permitted non-Owner role.')
+    user = session['user']
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        lock_organization_owner(cursor, user['organization_id'], user['global_user_id'])
+        # Any previous membership requires a separate reviewed recovery process;
+        # invitations never overwrite roles or reactivate revoked membership.
+        if cursor.execute("""SELECT 1 FROM OrganizationMemberships M JOIN Users U ON U.UserID=M.UserID
+            WHERE M.OrganizationID=? AND U.NormalizedEmail=?""", (user['organization_id'], email)).fetchone():
+            abort(409, description='This identity already has a membership; invitations cannot reactivate it.')
+        cursor.execute("""UPDATE OrganizationInvitations SET Status='Expired', VerificationHash=NULL,
+            VerificationExpiresAt=NULL WHERE OrganizationID=? AND Email=? AND Status='Pending'
+            AND ExpiresAt<=SYSUTCDATETIME()""", (user['organization_id'], email))
+        if cursor.execute("""SELECT 1 FROM OrganizationInvitations WHERE OrganizationID=? AND Email=? AND Status='Pending'""",
+                          (user['organization_id'], email)).fetchone():
+            abort(409, description='A pending invitation already exists. Revoke it before sending another.')
+        token = secrets.token_urlsafe(32)
+        cursor.execute("""INSERT OrganizationInvitations
+            (OrganizationID,Email,RoleName,TokenHash,CreatedByUserID,ExpiresAt)
+            VALUES (?,?,?,?,?,DATEADD(hour,48,SYSUTCDATETIME()))""",
+            (user['organization_id'], email, role, invitation_digest(token), user['global_user_id']))
+        if development_invitation_delivery():
+            link = url_for('accept_invitation') + '#token=' + token
+        else:
+            send_invitation_email(email, 'Your DukaanDesk employee invitation',
+                'You were invited to an organization as ' + role + '. This invitation expires in 48 hours.\n'
+                + invitation_link(token) + '\nSign in with the matching account, or verify your mailbox to register.')
+            link = None
+        conn.commit()
+        if link:
+            return render_template('invitation_created.html', link=link), 201
+        flash('Invitation sent. It expires in 48 hours.', 'success')
+        return redirect(url_for('organization_members'))
+    except pyodbc.IntegrityError:
+        conn.rollback()
+        abort(409, description='An invitation or membership already exists.')
+    except (pyodbc.Error, OSError, smtplib.SMTPException, RuntimeError, ValueError):
+        conn.rollback()
+        app.logger.error('Invitation creation or delivery failed; no invitation was committed.')
+        abort(503, description='Invitation delivery is unavailable. Contact your administrator.')
+    finally:
+        conn.close()
+
+
+@app.post('/organization/invitations/<uuid:invitation_id>/revoke')
+@require_permission('members.roles')
+def revoke_invitation(invitation_id):
+    user = session['user']
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        lock_organization_owner(cursor, user['organization_id'], user['global_user_id'])
+        row = cursor.execute("""SELECT Status FROM OrganizationInvitations WITH (UPDLOCK,HOLDLOCK)
+            WHERE InvitationID=? AND OrganizationID=?""", (str(invitation_id), user['organization_id'])).fetchone()
+        if not row:
+            abort(404)
+        if row.Status != 'Pending':
+            abort(409, description='Only pending invitations can be revoked.')
+        cursor.execute("""UPDATE OrganizationInvitations SET Status=CASE WHEN ExpiresAt<=SYSUTCDATETIME()
+            THEN 'Expired' ELSE 'Revoked' END, VerificationHash=NULL, VerificationExpiresAt=NULL
+            WHERE InvitationID=? AND OrganizationID=?""", (str(invitation_id), user['organization_id']))
+        conn.commit()
+        return redirect(url_for('organization_members'))
+    finally:
+        conn.close()
+
+
+@app.post('/organization/members/<int:member_id>/deactivate')
+@require_permission('members.roles')
+def deactivate_member(member_id):
+    user = session['user']
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        lock_organization_owner(cursor, user['organization_id'], user['global_user_id'])
+        target = cursor.execute("""SELECT RoleName FROM OrganizationMemberships WITH (UPDLOCK,HOLDLOCK)
+            WHERE OrganizationID=? AND UserID=? AND Status='Active'""", (user['organization_id'], member_id)).fetchone()
+        if not target:
+            abort(404)
+        if target.RoleName == 'Owner' and not cursor.execute("""SELECT 1 FROM OrganizationMemberships M WITH (UPDLOCK,HOLDLOCK)
+            JOIN Users U WITH (UPDLOCK,HOLDLOCK) ON U.UserID=M.UserID
+            WHERE M.OrganizationID=? AND M.UserID<>? AND M.Status='Active' AND M.RoleName='Owner'
+              AND U.IsActive=1 AND U.IsLocked=0 AND U.FailedAttempts<3""", (user['organization_id'], member_id)).fetchone():
+            abort(409, description='Keep at least one active, unlocked Owner.')
+        cursor.execute("UPDATE OrganizationMemberships SET Status='Inactive' WHERE OrganizationID=? AND UserID=?",
+                       (user['organization_id'], member_id))
+        conn.commit()
+        return redirect(url_for('organization_members'))
+    finally:
+        conn.close()
+
+
+@app.route('/invitations/accept', methods=['GET', 'POST'])
+def accept_invitation():
+    if request.method == 'GET':
+        return render_template('invitation_accept.html')
+    token = request.form.get('token', '')
+    action = request.form.get('action', '')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{43}', token) or action not in {'accept', 'verify', 'register'}:
+        abort(400, description='A valid invitation token and action are required.')
+    # Existing-user acceptance requires a freshly resolved, non-demo identity.
+    if action == 'accept' and (not session.get('user') or session['user'].get('is_demo')
+                               or not resolve_legacy_organization_context()):
+        abort(403, description='Sign in with the invited email address first, then reopen the invitation.')
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        locator = cursor.execute('SELECT OrganizationID FROM OrganizationInvitations WHERE TokenHash=?',
+                                 (invitation_digest(token),)).fetchone()
+        if not locator:
+            abort(404, description='Invitation unavailable.')
+        # All invitation and membership administration locks organization first.
+        cursor.execute('SELECT OrganizationID FROM Organizations WITH (UPDLOCK,HOLDLOCK) WHERE OrganizationID=?',
+                       (locator.OrganizationID,)).fetchone()
+        invite = cursor.execute("""SELECT *, CASE WHEN ExpiresAt<=SYSUTCDATETIME() THEN 1 ELSE 0 END AS IsExpired,
+            CASE WHEN VerificationExpiresAt>SYSUTCDATETIME() THEN 1 ELSE 0 END AS VerificationValid,
+            CASE WHEN VerificationSentAt>DATEADD(second,-60,SYSUTCDATETIME()) THEN 1 ELSE 0 END AS RecentlySent
+            FROM OrganizationInvitations WITH (UPDLOCK,HOLDLOCK) WHERE TokenHash=?""",
+            (invitation_digest(token),)).fetchone()
+        if invite.Status != 'Pending':
+            abort(410, description='Invitation is no longer pending.')
+        if invite.IsExpired:
+            cursor.execute("""UPDATE OrganizationInvitations SET Status='Expired',VerificationHash=NULL,
+                VerificationExpiresAt=NULL WHERE InvitationID=?""", (invite.InvitationID,))
+            conn.commit()
+            abort(410, description='Invitation expired.')
+        lock_organization_owner(cursor, invite.OrganizationID, invite.CreatedByUserID)
+        if invite.RoleName not in INVITABLE_ROLES:
+            abort(403)
+        existing = cursor.execute("""SELECT UserID,IsActive,IsLocked,FailedAttempts FROM Users WITH (UPDLOCK,HOLDLOCK)
+            WHERE NormalizedEmail=?""", (invite.Email,)).fetchone()
+        if existing and cursor.execute('SELECT 1 FROM OrganizationMemberships WHERE OrganizationID=? AND UserID=?',
+                                       (invite.OrganizationID, existing.UserID)).fetchone():
+            abort(409, description='Membership already exists; no role or status was changed.')
+        # Legacy business signup does not verify email. Therefore even an
+        # authenticated match must prove mailbox control, preventing signup with
+        # the invited address from laundering link possession into verification.
+        if action == 'verify':
+            if invite.RecentlySent:
+                abort(429, description='Wait one minute before requesting another verification code.')
+            verification = secrets.token_urlsafe(32)
+            send_invitation_email(invite.Email, 'Verify your DukaanDesk email',
+                'Use this separate verification code only if you requested employee membership.\n'
+                + verification + '\nIt expires in 15 minutes. This is not your invitation token.')
+            cursor.execute("""UPDATE OrganizationInvitations SET VerificationHash=?,
+                VerificationExpiresAt=DATEADD(minute,15,SYSUTCDATETIME()),VerificationSentAt=SYSUTCDATETIME()
+                WHERE InvitationID=?""", (invitation_digest(verification), invite.InvitationID))
+            conn.commit()
+            return render_template('invitation_accept.html', token=token,
+                                   notice='Verification code sent to the invited mailbox. It expires in 15 minutes.')
+        verification = request.form.get('verification', '')
+        if (not invite.VerificationValid or not invite.VerificationHash
+            or not hmac.compare_digest(invite.VerificationHash, invitation_digest(verification))):
+            abort(403, description='A separate, valid emailed verification code is required.')
+        if action == 'accept':
+            user = session['user']
+            if not existing or existing.UserID != user['global_user_id'] or not existing.IsActive or existing.IsLocked or existing.FailedAttempts>=3:
+                abort(403, description='Sign in with the invited email address.')
+            # Recheck the authenticating membership within this transaction too.
+            if not cursor.execute("""SELECT 1 FROM OrganizationMemberships WITH (UPDLOCK,HOLDLOCK)
+                WHERE UserID=? AND OrganizationID=? AND Status='Active'""",
+                (existing.UserID, user['organization_id'])).fetchone():
+                abort(403)
+            accepted_user_id = existing.UserID
+        else:
+            if existing:
+                abort(409, description='This email already has an account. Sign in to accept; registration cannot merge accounts.')
+            username = request.form.get('username', '').strip()
+            password = request.form.get('password', '')
+            if not USERNAME_RE.fullmatch(username) or not 10<=len(password)<=128 or password != request.form.get('confirm_password'):
+                abort(400, description='Use a valid username and matching passwords of 10–128 characters.')
+            # No seller or legacy account is invented for an invited employee.
+            accepted_user_id = cursor.execute("""INSERT Users (Email,Username,PasswordHash)
+                OUTPUT inserted.UserID VALUES (?,?,?)""",
+                (invite.Email, username, generate_password_hash(password))).fetchone()[0]
+        cursor.execute("""INSERT OrganizationMemberships (UserID,OrganizationID,Status,RoleName)
+            VALUES (?,?,'Active',?)""", (accepted_user_id, invite.OrganizationID, invite.RoleName))
+        cursor.execute("""UPDATE OrganizationInvitations SET Status='Accepted',AcceptedByUserID=?,
+            AcceptedAt=SYSUTCDATETIME(),VerificationHash=NULL,VerificationExpiresAt=NULL WHERE InvitationID=?""",
+            (accepted_user_id, invite.InvitationID))
+        conn.commit()
+        if action == 'register':
+            session.clear()
+        flash('Invitation accepted. Sign in or select the organization to continue.', 'success')
+        return redirect(url_for('dashboard' if action == 'accept' else 'login'))
+    except pyodbc.IntegrityError:
+        conn.rollback()
+        abort(409, description='An account or membership already exists; nothing was merged.')
+    except (pyodbc.Error, OSError, smtplib.SMTPException, RuntimeError, ValueError):
+        conn.rollback()
+        app.logger.error('Invitation acceptance or verification delivery failed.')
+        abort(503, description='Email or database service unavailable. New registration requires email verification.')
+    finally:
+        conn.close()
 
 
 @app.post("/orders/<int:order_id>/action")
