@@ -1,195 +1,175 @@
-<div align="center">
+# DukaanDesk
 
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0f172a,50:1d4ed8,100:06b6d4&height=180&section=header&text=DukaanDesk&fontSize=42&fontColor=ffffff&fontAlignY=36&desc=COD%20Order%20Operations%20for%20Online%20Sellers&descAlignY=57&descSize=16" alt="DukaanDesk — COD order operations for online sellers" width="100%" />
+DukaanDesk is a server-rendered Flask and Microsoft SQL Server MVP for cash-on-delivery order operations. A seller can onboard one business, expose a domain-scoped order form, review incoming orders, confirm or cancel them, record delivery outcomes, and view twelve-month summaries.
 
-**A Flask and SQL Server application for seller onboarding, storefront orders, verification, delivery tracking, and reporting.**
+The current code is a single-store-per-seller MVP. The intended product is a multi-tenant B2B SaaS that connects existing Shopify, WooCommerce, and custom storefronts, supports employees and roles, and gives a platform super admin subscription controls. Those capabilities are future work and are not implemented here.
 
-<img src="https://img.shields.io/badge/Python-Flask-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python and Flask" />
-<img src="https://img.shields.io/badge/SQL%20Server-T--SQL-CC2927?style=for-the-badge&logo=microsoftsqlserver&logoColor=white" alt="Microsoft SQL Server" />
-<img src="https://img.shields.io/badge/pyodbc-Database%20Access-06B6D4?style=for-the-badge" alt="pyodbc" />
-<img src="https://img.shields.io/badge/HTML5%20%2F%20CSS3-Frontend-1D4ED8?style=for-the-badge&logo=html5&logoColor=white" alt="HTML5 and CSS3" />
+## Current features
 
-</div>
+- Seller signup and session-based login.
+- Werkzeug `scrypt` password hashes for new users; a successful legacy plaintext login upgrades that row in place.
+- Lockout after three failed database or demo login attempts.
+- Explicit, opt-in, in-memory demo mode; it is off by default and never silently exposes demo data to database users.
+- Public order entry at `/store/<seller-domain>`.
+- Seller-scoped buyers, order numbers, dashboard queries, and mutations.
+- Pending order confirmation/cancellation and one-way delivery outcomes.
+- Delivered-revenue KPIs, search, and twelve-month delivered/cancelled/returned summaries.
+- CSRF tokens on every state-changing form, hardened session cookies, security headers, request-size limits, and debug mode off by default.
+- SQL Server view, set-based order-log trigger, message audit rows, and non-destructive migration checks.
+- Automated unit and Flask route tests that do not require SQL Server.
 
-## Overview
-
-DukaanDesk is a server-rendered web application for managing cash-on-delivery orders across seller-specific storefronts. Sellers can create accounts, receive orders through a public domain-based form, confirm or cancel incoming orders, update delivery outcomes, search operational records, and review twelve-month summaries and revenue indicators.
-
-The backend is implemented with Flask and `pyodbc`; Microsoft SQL Server stores sellers, portal users, buyers, orders, and message logs. A small fallback dataset and demo account allow parts of the interface to remain inspectable when the database is unavailable.
-
-## Key Features
-
-- Seller signup with business, WhatsApp, email, domain, username, and password fields.
-- Domain-aware public storefront order submission.
-- Seller-scoped buyer and order numbering.
-- Reuse of existing buyers by seller and phone number.
-- Login attempt tracking with account lockout after three failures.
-- Protected seller dashboard and session-based authentication.
-- Confirm/cancel actions for pending COD orders.
-- Delivery tracking for pending, delivered, and returned orders.
-- Search across identifiers, buyer details, address, amounts, dates, and statuses.
-- KPI summaries for total, active, confirmed, cancelled/returned, and delivered revenue.
-- Twelve-month summaries grouped by delivered, cancelled, and returned outcomes.
-- SQL trigger that creates an initial message-log entry for each new order.
-
-## Application Flow
-
-```mermaid
-flowchart LR
-    Seller["Seller signup / login"] --> Dashboard["Protected dashboard"]
-    Buyer["Public storefront"] --> Order["Create buyer + COD order"]
-    Order --> SQL[("SQL Server")]
-    SQL --> Dashboard
-    Dashboard --> Decision["Confirm or cancel"]
-    Decision --> Delivery["Pending / Delivered / Returned"]
-    Delivery --> Summary["KPIs + 12-month summary"]
-    SQL --> Logs["MessageLogs audit trail"]
-```
-
-## Database Design
-
-The schema is centered on five tables:
-
-- `Sellers` stores business identity, WhatsApp number, email, and domain.
-- `ClientUsers` stores seller-linked login accounts and failed-attempt state.
-- `Buyers` stores seller-scoped customer profiles and numbering.
-- `Orders` stores seller-scoped order numbers, amount, confirmation state, delivery state, and timestamps.
-- `MessageLogs` is a child entity used for order messages and audit history.
-
-Important constraints keep seller domains, emails, usernames, and seller-relative identifiers unique. `trg_AutoLogCreation` inserts an initial queued-confirmation message when an order is created. `vw_PendingConfirmations` exposes pending orders with seller and buyer details.
-
-> Password values are currently compared directly with the `PasswordHash` column. The project is suitable for coursework and local demonstration, but password hashing and production security hardening would be required before real deployment.
-
-## Project Structure
+## Repository map
 
 ```text
-DukaanDesk/
-├── app.py                 # Flask routes, sessions, database access, and business logic
-├── public/
-│   ├── login.html         # Seller login
-│   ├── signup.html        # Seller onboarding
-│   ├── dashboard.html     # Active order operations and KPIs
-│   ├── summary.html       # Twelve-month outcome summaries
-│   ├── store.html         # Public domain-based order form
-│   └── styles.css         # Shared interface styling
-├── 1_Schema.sql           # Database and table creation
-├── 2_Logic.sql            # Pending-order view and insert trigger
-├── 3_DataTesting.sql      # Local sample data
-├── 4_Reports.sql          # Seller performance and audit queries
-├── reset.sql              # Database reset helper
-├── requirements.txt       # Flask and pyodbc
-└── package.json           # Legacy Node dependency manifest
+app.py                 Flask configuration, routes, security, DB access, demo mode
+public/                Jinja HTML templates and shared CSS
+tests/test_app.py      Automated unit and route tests
+1_Schema.sql           Fresh database installer; aborts if CODManager exists
+2_Logic.sql            Pending-confirmations view and order insert trigger
+3_DataTesting.sql      Optional idempotent development seed data
+4_Reports.sql          Read-only reporting queries
+5_Migration.sql        Transactional hardening migration for an existing database
+checking.sql           User-owned ad-hoc query (not part of setup)
+reset.sql              Manual development unlock helper; review before use
+requirements.txt       Python runtime dependencies
+package.json           Legacy Node manifest; npm scripts delegate to Python
+PROJECT_CONTEXT.md     Detailed implementation handoff
+ROADMAP.md             Completed work and prioritized future direction
 ```
 
-The running application is Python/Flask-based. The Node dependencies in `package.json` are not used by `app.py` and are not required for the documented setup.
+## Prerequisites
 
-## Installation
+- Python 3.10 or newer.
+- Microsoft SQL Server or Azure SQL reachable from the application environment.
+- Microsoft ODBC Driver 18 for SQL Server.
+- A SQL client such as `sqlcmd`, SSMS, or Azure Data Studio for manual schema setup.
 
-### Prerequisites
+The development server is sufficient for local/Codespace evaluation only. A production WSGI server, managed secrets, TLS, monitoring, backup/restore validation, and external security testing are still required before launch.
 
-- Python 3.10 or newer
-- Microsoft SQL Server or SQL Server Express
-- SQL Server Management Studio or another T-SQL client
-- Microsoft ODBC Driver 18 for SQL Server
+## Install
 
-### 1. Install the Application
+### PowerShell
 
 ```powershell
-git clone https://github.com/FarisDosani/DukaanDesk.git
-cd DukaanDesk
-
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-### 2. Create the Database
+### Linux / GitHub Codespaces
 
-Run the SQL scripts against your local SQL Server in this order:
+Install Microsoft ODBC Driver 18 using Microsoft's instructions for the Codespace's Linux distribution, then run:
 
-1. `1_Schema.sql` — recreates `CODManager` and its tables.
-2. `2_Logic.sql` — creates the pending-order view and order-log trigger.
-3. `3_DataTesting.sql` — optional sample data for local testing.
-
-`1_Schema.sql` drops an existing `CODManager` database before rebuilding it. Review the target server carefully before executing it.
-
-`4_Reports.sql` contains read-only example reports and can be run after data exists.
-
-### 3. Configure the Connection
-
-The application defaults to local SQL Server Express with Windows authentication:
-
-```text
-Server: .\SQLEXPRESS
-Database: CODManager
-Driver: ODBC Driver 18 for SQL Server
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-Override settings through environment variables when needed:
+## Database setup
 
-```powershell
-$env:DB_SERVER = ".\SQLEXPRESS"
-$env:DB_NAME = "CODManager"
-$env:SESSION_SECRET = "replace-with-a-local-secret"
-```
+For a brand-new local database, run these manually in order:
 
-`DB_PORT` is optional. The current connection builder uses trusted Windows authentication, disables encryption, and trusts the server certificate for local development.
+1. `1_Schema.sql`
+2. `2_Logic.sql`
+3. `3_DataTesting.sql` (optional development data)
 
-### 4. Start the App
+`1_Schema.sql` refuses to continue if `CODManager` already exists. It no longer drops a database. For an existing database, back it up, review the preflight rules, then run `5_Migration.sql` manually. The migration is transactional and rolls back if it finds invalid state or cross-seller order/buyer rows. Re-run `2_Logic.sql` afterward to install the corrected set-based trigger.
 
-```powershell
-python app.py
-```
+No database script is run automatically by the Flask application. `reset.sql` changes account lock state and is only a manual development helper.
 
-Open `http://localhost:3000`.
-
-## Usage
-
-### Seller Workflow
-
-1. Create a seller account from `/signup`.
-2. Sign in at `/login`.
-3. Share `/store/<domain-name>` as the seller-specific order form.
-4. Review active orders on `/dashboard`.
-5. Confirm or cancel each order.
-6. Mark confirmed orders as delivered or returned by the buyer.
-7. Review historical outcomes on `/summary`.
-
-### Public Storefront
-
-The store form accepts a seller domain, buyer name, phone number, delivery address, and order amount. A matching seller must already exist. Successful submissions create or reuse a seller-scoped buyer and assign the next seller-relative order number.
-
-### Local Fallback Demo
-
-If database login fails, the code includes a local fallback account for interface testing:
+The optional seed credentials are:
 
 ```text
 Email:    waqtoro@example.com
 Username: waqtoro-admin
-Password: admin123
+Password: ChangeMe123!
 ```
 
-The fallback contains a single sample order and does not replace the SQL-backed workflow. Change or remove demo credentials before any deployment outside a controlled local environment.
+Change or remove seeded credentials outside local development.
 
-## Reporting
+## Configuration
 
-`4_Reports.sql` contains two examples:
+Set environment variables in the shell or deployment secret manager. Do not commit a `.env` file.
 
-- seller-level order count and total order value;
-- chronological message-log audit history.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SESSION_SECRET` | random per process | Required stable secret for persistent/multi-worker sessions |
+| `SESSION_COOKIE_SECURE` | `false` | Set `true` behind HTTPS |
+| `DB_SERVER` | `.\SQLEXPRESS` | SQL Server host/instance |
+| `DB_PORT` | unset | Optional SQL Server port |
+| `DB_NAME` | `CODManager` | Database name |
+| `DB_DRIVER` | `ODBC Driver 18 for SQL Server` | Installed ODBC driver name |
+| `DB_USERNAME` / `DB_PASSWORD` | unset | SQL authentication; if absent, trusted authentication is used |
+| `DB_ENCRYPT` | `true` | ODBC transport encryption |
+| `DB_TRUST_SERVER_CERTIFICATE` | `false` | Use `true` only for a controlled local/self-signed server |
+| `DB_CONNECTION_TIMEOUT` | `5` | Connection timeout in seconds |
+| `APP_HOST` | `0.0.0.0` | Development server bind address |
+| `PORT` | `3000` | HTTP port |
+| `FLASK_DEBUG` | `false` | Local debugging only |
 
-The Flask summary view additionally groups delivered, cancelled, and returned orders across the latest twelve calendar months. Delivered revenue is calculated from orders whose delivery state is `Delivered`.
+Example for a Codespace connecting to a SQL-authenticated development server:
 
-## Current Scope
+```bash
+export SESSION_SECRET='replace-with-a-long-random-value'
+export DB_SERVER='your-sql-host'
+export DB_PORT='1433'
+export DB_NAME='CODManager'
+export DB_USERNAME='your-app-user'
+export DB_PASSWORD='set-this-in-codespace-secrets'
+export DB_ENCRYPT='true'
+export DB_TRUST_SERVER_CERTIFICATE='false'
+python app.py
+```
 
-DukaanDesk demonstrates seller onboarding and COD order operations. It does not currently implement product catalog or stock tables, payment processing, real WhatsApp delivery, production-grade password storage, or deployment hardening.
+Open the forwarded port 3000. Seller workflow: `/signup` → `/dashboard`; buyer workflow: `/store/<domain-name>`.
 
----
+### Explicit demo mode
 
-<div align="center">
+Demo mode is off by default. It uses isolated process memory and loses changes on restart. It is intended only for UI evaluation when SQL Server is unavailable.
 
-<a href="https://github.com/FarisDosani/DukaanDesk">View repository</a> · <a href="https://github.com/FarisDosani/DukaanDesk/issues">Report an issue</a>
+```powershell
+$env:SESSION_SECRET = "replace-with-a-long-random-value"
+$env:DEMO_MODE = "true"
+$env:DEMO_EMAIL = "demo@example.com"
+$env:DEMO_USERNAME = "demo-owner"
+$env:DEMO_PASSWORD = "choose-a-demo-password"
+$env:DEMO_DOMAIN = "demo.local"
+python app.py
+```
 
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0f172a,50:1d4ed8,100:06b6d4&height=85&section=footer" alt="" width="100%" />
+If database login raises an availability/schema error and the submitted credentials match the configured demo account, the app starts an isolated demo session. Database users never receive demo orders. Orders submitted to the configured demo domain are also kept only in memory.
 
-</div>
+## Test
+
+No database service is required for the automated suite:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+or:
+
+```powershell
+python -m pytest -q -p no:cacheprovider
+```
+
+Syntax and dependency checks:
+
+```powershell
+python -m py_compile app.py tests/test_app.py
+python -m pip check
+```
+
+## Known limitations
+
+- SQL Server-backed end-to-end behavior has not been verified in the current environment because no database endpoint/configuration is available.
+- Passwords left as legacy plaintext remain so until that user successfully logs in; a forced reset/migration flow is still needed before real launch.
+- Account unlock is manual; there is no password reset, email verification, MFA, or administrative recovery workflow.
+- Public order submission has no rate limiting, bot protection, webhook authentication, product catalog, inventory, taxes, shipping calculation, or payment integration.
+- Flask's signed cookie session is used; there is no shared server-side session store.
+- Current tenancy is one seller/business/domain per signup. Connected stores, employees/RBAC, platform administration, and subscriptions are roadmap items.
+
+See [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) for the detailed technical handoff and [ROADMAP.md](ROADMAP.md) for priorities.
