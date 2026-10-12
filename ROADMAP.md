@@ -6,7 +6,7 @@ Last updated: 2026-10-12
 
 DukaanDesk should evolve from the current single-domain COD operations MVP into a multi-tenant B2B SaaS for businesses that already sell through Shopify, WooCommerce, or custom websites. A business should eventually connect multiple stores, assign employees role-based access, consolidate orders and analytics, and manage a subscription. A platform super admin should manage tenant onboarding, plans, service health, and support operations.
 
-This direction is intentionally not implemented in the current security/MVP pass. It requires explicit architecture and migration design rather than incremental columns added to the coursework schema.
+Phase 2.1 now provides the first additive tenant foundation: immutable organization IDs mapped one-to-one to legacy sellers. Multi-store, membership/RBAC, super-admin, and subscription capabilities remain deliberately unimplemented.
 
 ## Completed in the current MVP hardening pass
 
@@ -29,22 +29,25 @@ This direction is intentionally not implemented in the current security/MVP pass
 - Added a transactional, non-destructive schema hardening migration with data preflight checks.
 - Added automated coverage for critical security and workflow behavior.
 - Replaced the unusable README and added a complete technical handoff.
+- Added `Organizations` as immutable tenant identities with a unique legacy `SellerID` mapping.
+- Added an idempotent transactional migration that safely backfills every existing seller.
+- Resolved tenant context from authenticated database mappings and enforced organization plus seller scope on protected order reads/writes.
 
-Completion here means code/tests were verified without SQL Server. It does not mean the migration or SQL-backed flows have been executed.
+The original hardening and Phase 2.1 organization work have now been verified against the disposable SQL Server database described below. This still does not establish production readiness.
 
 ## Verification checkpoint — 2026-10-12
 
-- Offline verification is green: 16 tests pass, two guarded SQL tests skip by default, and five invalid-amount subtests pass. Compilation and dependency checks pass.
-- SQL verification is green: the full suite reports 18 passed against the confirmed disposable `DukaanDesk_Test` database on `localhost\MSSQLSERVER01`.
+- Offline verification is green: 18 tests pass, three guarded SQL tests skip by default, and five invalid-amount subtests pass. Compilation passes.
+- SQL verification is green: the full suite reports 21 passed against the confirmed disposable `DukaanDesk_Test` database on `localhost\MSSQLSERVER01`.
 - Signup, password hashing, hashed login, legacy-plaintext upgrade, lockout, order creation, confirmation/cancellation, delivery, tenant isolation, exact message logs, summaries, and concurrent seller-relative numbering were exercised against real SQL Server.
-- Read-only migration preflight found no invalid or cross-seller rows. The non-destructive migration completed on populated test data and retained enabled/trusted constraints. Seed and reset scripts were not run; `CODManager` remained absent.
-- **Phase 2.1 MVP-verification gate is open.** Multi-tenant design and isolated development may begin, while the remaining launch P0 items stay mandatory before production.
+- Read-only migration preflight found no invalid or cross-seller rows. The organization migration backfilled all 18 existing sellers without changing legacy row fingerprints, and a second run inserted zero rows. Seed and reset scripts were not run; `CODManager` remained absent.
+- **Phase 2.1 organization foundation is complete.** The additive migration preserved the original synthetic dataset, backfilled every seller, and passed idempotence, immutability, mapping, and cross-organization tests.
 
 ## P0 — required before any real launch
 
 1. **Verify on a disposable SQL Server clone — completed 2026-10-12**
    - Created only the previously absent `DukaanDesk_Test`; no existing database was overwritten.
-   - Installed the fresh schema/view/trigger, ran read-only migration preflight, and applied the non-destructive migration successfully.
+   - Installed the fresh schema/view/trigger, ran read-only migration preflight, and applied both non-destructive migrations successfully.
    - Verified signup, hashed login, legacy-password upgrade, lockout, public order creation, concurrent numbering, valid/rejected state transitions, tenant isolation, message logs, dashboard behavior, and summaries.
 
 2. **Remove remaining legacy plaintext exposure**
@@ -84,10 +87,11 @@ Completion here means code/tests were verified without SQL Server. It does not m
 
 ## P2 — multi-tenant SaaS foundation
 
-Design this as a versioned migration and service-boundary project. Do not overload `Sellers.DomainName` or the current session dictionary.
+Continue this as a versioned migration and service-boundary project. Keep `Sellers.DomainName` as a legacy field and keep only the minimal authenticated organization context in the signed session.
 
 1. **Tenant model**
-   - Introduce `Organizations`/business tenants with immutable tenant IDs.
+   - Completed in Phase 2.1: introduce `Organizations`/business tenants with immutable tenant IDs and one-to-one legacy seller mapping.
+   - Completed in Phase 2.1: require both organization and legacy seller boundaries on current protected order reads/writes.
    - Move subscription and ownership boundaries to the organization.
    - Define tenant-aware unique keys, query guards, audit records, exports, and deletion policy.
 

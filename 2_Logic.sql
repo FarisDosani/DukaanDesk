@@ -32,3 +32,20 @@ BEGIN
     FROM inserted;
 END;
 GO
+
+-- Organization IDs and their legacy SellerID mappings are permanent tenant identities.
+-- Future lifecycle work should add status/soft-delete fields instead of changing these keys.
+CREATE OR ALTER TRIGGER trg_Organizations_ImmutableIdentity
+ON Organizations
+AFTER UPDATE, DELETE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF NOT EXISTS (SELECT 1 FROM inserted)
+        THROW 50012, 'Organizations cannot be deleted; use a future lifecycle status instead.', 1;
+
+    IF UPDATE(OrganizationID) OR UPDATE(LegacySellerID)
+        THROW 50013, 'OrganizationID and LegacySellerID are immutable.', 1;
+END;
+GO

@@ -1,6 +1,7 @@
 import unittest
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -43,6 +44,8 @@ class SequenceCursor:
 
 
 class DukaanDeskTests(unittest.TestCase):
+    TEST_ORGANIZATION_ID = "11111111-1111-1111-1111-111111111111"
+
     def setUp(self):
         dukaan.app.config.update(TESTING=True, SECRET_KEY="test-secret")
         self.client = dukaan.app.test_client()
@@ -52,7 +55,7 @@ class DukaanDeskTests(unittest.TestCase):
         with self.client.session_transaction() as current_session:
             return current_session["csrf_token"]
 
-    def sign_in_session(self, seller_id=42, is_demo=False):
+    def sign_in_session(self, seller_id=42, is_demo=False, organization_id=None):
         token = self.csrf()
         with self.client.session_transaction() as current_session:
             current_session["user"] = {
@@ -60,6 +63,9 @@ class DukaanDeskTests(unittest.TestCase):
                 "email": "owner@example.com",
                 "username": "owner",
                 "seller_id": seller_id,
+                "organization_id": organization_id or (
+                    dukaan.DEMO_ORGANIZATION_ID if is_demo else self.TEST_ORGANIZATION_ID
+                ),
                 "business_name": "Test Shop",
                 "domain_name": "test.local",
                 "is_demo": is_demo,
@@ -99,6 +105,7 @@ class DukaanDeskTests(unittest.TestCase):
             "username": "demo-owner",
             "password_hash": dukaan.generate_password_hash("demo-password"),
             "seller_id": 1,
+            "organization_id": dukaan.DEMO_ORGANIZATION_ID,
             "business_name": "Demo Shop",
             "domain_name": "demo.local",
         }
@@ -124,7 +131,9 @@ class DukaanDeskTests(unittest.TestCase):
 
     def test_database_failure_never_exposes_demo_rows_to_normal_session(self):
         with patch.object(dukaan, "get_db_connection", side_effect=RuntimeError("database offline")):
-            orders, source = dukaan.fetch_orders_for_dashboard(1, allow_demo=False)
+            orders, source = dukaan.fetch_orders_for_dashboard(
+                1, self.TEST_ORGANIZATION_ID, allow_demo=False
+            )
         self.assertEqual(orders, [])
         self.assertEqual(source, "database unavailable")
 
@@ -135,6 +144,7 @@ class DukaanDeskTests(unittest.TestCase):
             "username": "demo-owner",
             "password_hash": dukaan.generate_password_hash("demo-password"),
             "seller_id": 1,
+            "organization_id": dukaan.DEMO_ORGANIZATION_ID,
             "business_name": "Demo Shop",
             "domain_name": "demo.local",
         }
@@ -177,7 +187,9 @@ class DukaanDeskTests(unittest.TestCase):
             self.assertIn(b"Rs. 100.00", summary.data)
 
     def test_signup_stores_a_hash(self):
-        cursor = SequenceCursor([None, None, (11,), (22,)])
+        cursor = SequenceCursor(
+            [None, None, (11,), (self.TEST_ORGANIZATION_ID,), (22,)]
+        )
         connection = FakeConnection(cursor)
         payload = {
             "business_name": "Acme",
@@ -195,6 +207,11 @@ class DukaanDeskTests(unittest.TestCase):
         self.assertTrue(dukaan.check_password_hash(stored_value, payload["password"]))
         self.assertNotEqual(stored_value, payload["password"])
         self.assertEqual(created["seller_id"], 11)
+        self.assertEqual(created["organization_id"], self.TEST_ORGANIZATION_ID)
+        organization_insert = next(
+            item for item in cursor.executions if "INSERT INTO Organizations" in item[0]
+        )
+        self.assertEqual(organization_insert[1], (11, "Acme"))
         self.assertEqual(connection.commit_count, 1)
         self.assertTrue(connection.closed)
 
@@ -232,6 +249,7 @@ class DukaanDeskTests(unittest.TestCase):
             Email="owner@example.com",
             BusinessName="Shop",
             DomainName="shop.test",
+            OrganizationID=self.TEST_ORGANIZATION_ID,
         )
         cursor = SequenceCursor([row])
         connection = FakeConnection(cursor)
@@ -239,6 +257,7 @@ class DukaanDeskTests(unittest.TestCase):
             result = dukaan.login_with_database("owner@example.com", "owner", "legacy-secret")
 
         self.assertTrue(result["ok"])
+        self.assertEqual(result["user"]["organization_id"], self.TEST_ORGANIZATION_ID)
         upgrade = next(item for item in cursor.executions if "SET PasswordHash" in item[0])
         self.assertTrue(dukaan.check_password_hash(upgrade[1][0], "legacy-secret"))
         self.assertEqual(connection.commit_count, 1)
@@ -278,15 +297,58 @@ class DukaanDeskTests(unittest.TestCase):
         with patch.object(dukaan, "get_db_connection", return_value=connection):
             response = self.client.post(
                 "/orders/9/action",
-                data={"csrf_token": token, "action": "confirm", "search": ""},
+                data={
+                    "csrf_token": token,
+                    "action": "confirm",
+                    "search": "",
+                    "organization_id": "22222222-2222-2222-2222-222222222222",
+                },
             )
 
         self.assertEqual(response.status_code, 302)
         update = next(item for item in cursor.executions if "UPDATE Orders" in item[0])
         self.assertIn("SellerID = ?", update[0])
+        self.assertIn("Org.OrganizationID = ?", update[0])
         self.assertIn("OrderStatus = 'Pending'", update[0])
-        self.assertEqual(update[1][-2:], (9, 42))
+        self.assertEqual(update[1][-3:], (9, 42, self.TEST_ORGANIZATION_ID))
         self.assertEqual(connection.commit_count, 1)
+
+    def test_legacy_session_resolves_organization_from_user_mapping(self):
+        row = SimpleNamespace(
+            UserID=7,
+            SellerID=42,
+            OrganizationID=self.TEST_ORGANIZATION_ID,
+        )
+        connection = FakeConnection(SequenceCursor([row]))
+        with dukaan.app.test_request_context("/dashboard"):
+            dukaan.session["user"] = {
+                "id": 7,
+                "seller_id": 42,
+                "username": "owner",
+                "business_name": "Test Shop",
+                "is_demo": False,
+            }
+            with patch.object(dukaan, "get_db_connection", return_value=connection):
+                self.assertTrue(dukaan.resolve_legacy_organization_context())
+            self.assertEqual(
+                dukaan.session["user"]["organization_id"], self.TEST_ORGANIZATION_ID
+            )
+        query = connection.cursor_instance.executions[0]
+        self.assertIn("WHERE CU.UserID = ?", query[0])
+        self.assertEqual(query[1], (7,))
+        self.assertTrue(connection.closed)
+
+    def test_organization_migration_is_additive_and_backfills_sellers(self):
+        migration = (Path(__file__).parents[1] / "6_Organizations.sql").read_text(
+            encoding="utf-8"
+        )
+        normalized = migration.upper()
+        self.assertIn("WHERE NOT EXISTS", normalized)
+        self.assertIn("LEGACYSELLERID", normalized)
+        self.assertIn("TRG_ORGANIZATIONS_IMMUTABLEIDENTITY", normalized)
+        self.assertNotIn("DROP TABLE", normalized)
+        self.assertNotIn("DELETE FROM", normalized)
+        self.assertNotIn("TRUNCATE", normalized)
 
     def test_delivery_transition_rejects_pending_as_an_outcome(self):
         token = self.sign_in_session()

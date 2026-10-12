@@ -24,7 +24,19 @@ CREATE TABLE Sellers (
     DomainName NVARCHAR(120) UNIQUE NOT NULL
 );
 
--- 2. Buyers Table
+-- 2. Organizations (immutable SaaS tenant identity; one-to-one with legacy Sellers)
+CREATE TABLE Organizations (
+    OrganizationID UNIQUEIDENTIFIER ROWGUIDCOL NOT NULL
+        CONSTRAINT DF_Organizations_OrganizationID DEFAULT NEWSEQUENTIALID(),
+    LegacySellerID INT NOT NULL,
+    OrganizationName NVARCHAR(100) NOT NULL,
+    CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_Organizations_CreatedAt DEFAULT GETDATE(),
+    CONSTRAINT PK_Organizations PRIMARY KEY (OrganizationID),
+    CONSTRAINT UQ_Organizations_LegacySellerID UNIQUE (LegacySellerID),
+    CONSTRAINT FK_Organizations_Sellers FOREIGN KEY (LegacySellerID) REFERENCES Sellers(SellerID)
+);
+
+-- 3. Buyers Table
 CREATE TABLE Buyers (
     BuyerID INT IDENTITY(1,1) PRIMARY KEY,
     SellerID INT NOT NULL FOREIGN KEY REFERENCES Sellers(SellerID) ON DELETE CASCADE,
@@ -37,7 +49,7 @@ CREATE TABLE Buyers (
     CONSTRAINT UQ_Buyers_SellerBuyerIdentity UNIQUE (SellerID, BuyerID)
 );
 
--- 2b. ClientUsers Table (portal login accounts per seller)
+-- 3b. ClientUsers Table (portal login accounts per seller)
 CREATE TABLE ClientUsers (
     UserID INT IDENTITY(1,1) PRIMARY KEY,
     SellerID INT NOT NULL FOREIGN KEY REFERENCES Sellers(SellerID) ON DELETE CASCADE,
@@ -49,7 +61,7 @@ CREATE TABLE ClientUsers (
     CreatedAt DATETIME2 NOT NULL DEFAULT GETDATE()
 );
 
--- 3. Orders Table
+-- 4. Orders Table
 CREATE TABLE Orders (
     OrderID INT IDENTITY(1,1) PRIMARY KEY,
     SellerID INT NOT NULL FOREIGN KEY REFERENCES Sellers(SellerID),
@@ -74,7 +86,7 @@ CREATE TABLE Orders (
         REFERENCES Buyers(SellerID, BuyerID)
 );
 
--- 4. MessageLogs (The Weak Entity)
+-- 5. MessageLogs (The Weak Entity)
 CREATE TABLE MessageLogs (
     LogID INT IDENTITY(1,1),
     OrderID INT NOT NULL,

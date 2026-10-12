@@ -79,6 +79,7 @@ if not configured_session_secret:
 
 DEMO_MODE = env_flag("DEMO_MODE", False)
 DEMO_PASSWORD = os.getenv("DEMO_PASSWORD")
+DEMO_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000001"
 DEMO_USERS = {}
 if DEMO_MODE and DEMO_PASSWORD:
     demo_username = os.getenv("DEMO_USERNAME", "waqtoro-admin")
@@ -88,6 +89,7 @@ if DEMO_MODE and DEMO_PASSWORD:
         "username": demo_username,
         "password_hash": generate_password_hash(DEMO_PASSWORD),
         "seller_id": 1,
+        "organization_id": DEMO_ORGANIZATION_ID,
         "business_name": os.getenv("DEMO_BUSINESS_NAME", "Waqtoro Watches"),
         "domain_name": os.getenv("DEMO_DOMAIN", "waqtoro.local").strip().lower(),
     }
@@ -196,6 +198,7 @@ def build_user_session(user: dict) -> dict:
         "email": user.get("email"),
         "username": user["username"],
         "seller_id": user["seller_id"],
+        "organization_id": user.get("organization_id"),
         "business_name": user["business_name"],
         "domain_name": user.get("domain_name"),
         "is_demo": bool(user.get("is_demo", False)),
@@ -259,7 +262,11 @@ def db_error_text(err: Exception) -> str:
 
 
 def is_missing_auth_table(err: Exception) -> bool:
-    return "invalid object name 'clientusers'" in db_error_text(err)
+    text = db_error_text(err)
+    return (
+        "invalid object name 'clientusers'" in text
+        or "invalid object name 'organizations'" in text
+    )
 
 
 def is_missing_signup_table(err: Exception) -> bool:
@@ -267,6 +274,7 @@ def is_missing_signup_table(err: Exception) -> bool:
     return (
         "invalid object name 'clientusers'" in text
         or "invalid object name 'sellers'" in text
+        or "invalid object name 'organizations'" in text
         or "invalid object name 'buyers'" in text
         or "invalid object name 'orders'" in text
     )
@@ -300,9 +308,52 @@ def require_auth(view_fn):
         if session["user"].get("is_demo") and not (DEMO_MODE and DEMO_USERS):
             session.clear()
             return redirect(url_for("login"))
+        if not session["user"].get("organization_id"):
+            if not resolve_legacy_organization_context():
+                session.clear()
+                flash("Your organization could not be resolved. Please sign in again.", "error")
+                return redirect(url_for("login"))
         return view_fn(*args, **kwargs)
 
     return wrapped
+
+
+def resolve_legacy_organization_context() -> bool:
+    """Upgrade a pre-Phase-2.1 session from its authenticated ClientUsers mapping."""
+    user = session.get("user")
+    if not user:
+        return False
+    if user.get("is_demo"):
+        user["organization_id"] = DEMO_ORGANIZATION_ID
+        session["user"] = user
+        return True
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        row = conn.cursor().execute(
+            """
+            SELECT TOP 1
+                CU.UserID,
+                CU.SellerID,
+                Org.OrganizationID
+            FROM ClientUsers CU
+            INNER JOIN Organizations Org ON Org.LegacySellerID = CU.SellerID
+            WHERE CU.UserID = ?
+            """,
+            (user.get("id"),),
+        ).fetchone()
+        if not row or int(row.SellerID) != int(user.get("seller_id", -1)):
+            return False
+        user["organization_id"] = str(row.OrganizationID)
+        session["user"] = user
+        return True
+    except Exception as err:
+        app.logger.error("Organization context resolution failed: %s", err)
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def login_with_database(email: str, username: str, password: str) -> dict:
@@ -320,9 +371,11 @@ def login_with_database(email: str, username: str, password: str) -> dict:
                 S.SellerID,
                 S.Email,
                 S.BusinessName,
-                S.DomainName
+                S.DomainName,
+                Org.OrganizationID
             FROM ClientUsers CU
             INNER JOIN Sellers S ON S.SellerID = CU.SellerID
+            INNER JOIN Organizations Org ON Org.LegacySellerID = S.SellerID
             WHERE CU.Username = ? AND S.Email = ?
             """,
             (username, email),
@@ -402,6 +455,7 @@ def login_with_database(email: str, username: str, password: str) -> dict:
                 "email": row.Email,
                 "username": row.Username,
                 "seller_id": int(row.SellerID),
+                "organization_id": str(row.OrganizationID),
                 "business_name": row.BusinessName,
                 "domain_name": row.DomainName,
             },
@@ -449,6 +503,7 @@ def login_with_demo_user(email: str, username: str, password: str) -> dict:
             "email": user["email"],
             "username": user["username"],
             "seller_id": user["seller_id"],
+            "organization_id": user.get("organization_id", DEMO_ORGANIZATION_ID),
             "business_name": user["business_name"],
             "domain_name": user["domain_name"],
             "is_demo": True,
@@ -506,6 +561,19 @@ def signup_with_database(payload: dict) -> dict:
 
         cursor.execute(
             """
+            INSERT INTO Organizations (LegacySellerID, OrganizationName)
+            OUTPUT INSERTED.OrganizationID
+            VALUES (?, ?)
+            """,
+            (seller_id, business_name),
+        )
+        inserted_organization = cursor.fetchone()
+        if not inserted_organization or inserted_organization[0] is None:
+            raise RuntimeError("Unable to create organization.")
+        organization_id = str(inserted_organization[0])
+
+        cursor.execute(
+            """
             INSERT INTO ClientUsers (SellerID, Username, PasswordHash)
             OUTPUT INSERTED.UserID
             VALUES (?, ?, ?)
@@ -524,6 +592,7 @@ def signup_with_database(payload: dict) -> dict:
             "email": email,
             "username": payload["username"],
             "seller_id": seller_id,
+            "organization_id": organization_id,
             "business_name": business_name,
             "domain_name": domain_name,
         }
@@ -581,15 +650,21 @@ def filter_dashboard_orders(orders: list, raw_search: str) -> list:
 
 def fetch_orders_for_dashboard(
     seller_id: int,
+    organization_id: str | None = None,
     search: str = "",
     apply_search: bool = True,
     allow_demo: bool = False,
 ):
     if allow_demo and DEMO_MODE and DEMO_USERS:
+        if organization_id != DEMO_ORGANIZATION_ID:
+            return [], "organization unavailable"
         rows = [deepcopy(row) for row in DEMO_ORDERS if row["SellerID"] == seller_id]
         if apply_search:
             rows = filter_dashboard_orders(rows, search)
         return rows, "demo"
+
+    if not organization_id:
+        return [], "organization unavailable"
 
     conn = None
     try:
@@ -617,11 +692,12 @@ def fetch_orders_for_dashboard(
                 O.OrderDate
             FROM Orders O
             INNER JOIN Sellers S ON O.SellerID = S.SellerID
+            INNER JOIN Organizations Org ON Org.LegacySellerID = O.SellerID
             INNER JOIN Buyers B ON O.BuyerID = B.BuyerID AND B.SellerID = O.SellerID
-            WHERE O.SellerID = ?
+            WHERE O.SellerID = ? AND Org.OrganizationID = ?
             ORDER BY O.OrderDate DESC
             """,
-            (seller_id,),
+            (seller_id, organization_id),
         )
         columns = [desc[0] for desc in cursor.description]
         rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -792,9 +868,10 @@ def place_public_order(payload: dict) -> dict:
         cursor.execute("SET XACT_ABORT ON;")
         cursor.execute(
             """
-            SELECT TOP 1 SellerID, BusinessName
-            FROM Sellers WITH (UPDLOCK, HOLDLOCK)
-            WHERE DomainName = ?
+            SELECT TOP 1 S.SellerID, S.BusinessName, Org.OrganizationID
+            FROM Sellers S WITH (UPDLOCK, HOLDLOCK)
+            INNER JOIN Organizations Org ON Org.LegacySellerID = S.SellerID
+            WHERE S.DomainName = ?
             """,
             (domain_name,),
         )
@@ -803,6 +880,7 @@ def place_public_order(payload: dict) -> dict:
             raise LookupError("SELLER_NOT_FOUND")
 
         seller_id = int(seller.SellerID)
+        organization_id = str(seller.OrganizationID)
 
         # Reuse existing buyer by WhatsApp/phone so one number maps to one BuyerID per seller.
         cursor.execute(
@@ -888,6 +966,7 @@ def place_public_order(payload: dict) -> dict:
             "buyer_id": buyer_id,
             "seller_buyer_no": seller_buyer_no,
             "seller_id": seller_id,
+            "organization_id": organization_id,
             "business_name": seller.BusinessName,
             "domain_name": domain_name,
         }
@@ -947,6 +1026,7 @@ def place_demo_order(payload: dict) -> dict:
         "buyer_id": buyer_id,
         "seller_buyer_no": seller_buyer_no,
         "seller_id": seller_id,
+        "organization_id": demo_user.get("organization_id", DEMO_ORGANIZATION_ID),
         "business_name": demo_user["business_name"],
         "domain_name": demo_user["domain_name"],
     }
@@ -1090,7 +1170,10 @@ def dashboard():
     user = session["user"]
     search = str(request.args.get("search", "")).strip()
     all_orders, source = fetch_orders_for_dashboard(
-        user["seller_id"], apply_search=False, allow_demo=user.get("is_demo", False)
+        user["seller_id"],
+        user["organization_id"],
+        apply_search=False,
+        allow_demo=user.get("is_demo", False),
     )
     active_orders = [order for order in all_orders if is_active_dashboard_order(order)]
     active_orders = filter_dashboard_orders(active_orders, search)
@@ -1111,7 +1194,10 @@ def dashboard():
 def summary_page():
     user = session["user"]
     all_orders, source = fetch_orders_for_dashboard(
-        user["seller_id"], apply_search=False, allow_demo=user.get("is_demo", False)
+        user["seller_id"],
+        user["organization_id"],
+        apply_search=False,
+        allow_demo=user.get("is_demo", False),
     )
     active_orders = [order for order in all_orders if is_active_dashboard_order(order)]
     summary_sections = build_summary_sections(all_orders)
@@ -1155,10 +1241,22 @@ def update_order_action(order_id: int):
                 DeliveryStatus = ?
             WHERE OrderID = ?
               AND SellerID = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM Organizations Org
+                  WHERE Org.LegacySellerID = Orders.SellerID
+                    AND Org.OrganizationID = ?
+              )
               AND OrderStatus = 'Pending'
               AND DeliveryStatus IS NULL
             """,
-            (next_status, next_delivery_status, order_id, session["user"]["seller_id"]),
+            (
+                next_status,
+                next_delivery_status,
+                order_id,
+                session["user"]["seller_id"],
+                session["user"]["organization_id"],
+            ),
         )
         rows_affected = cursor.rowcount
 
@@ -1217,10 +1315,21 @@ def update_order_status(order_id: int):
             SET DeliveryStatus = ?
             WHERE OrderID = ?
               AND SellerID = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM Organizations Org
+                  WHERE Org.LegacySellerID = Orders.SellerID
+                    AND Org.OrganizationID = ?
+              )
               AND OrderStatus = 'Confirmed'
               AND DeliveryStatus = 'Pending'
             """,
-            (next_delivery_status, order_id, session["user"]["seller_id"]),
+            (
+                next_delivery_status,
+                order_id,
+                session["user"]["seller_id"],
+                session["user"]["organization_id"],
+            ),
         )
         rows_affected = cursor.rowcount
 

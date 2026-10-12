@@ -105,9 +105,14 @@ class SQLIntegrationTests(unittest.TestCase):
 
         user_row = self.query_one(
             """
-            SELECT CU.PasswordHash, CU.FailedAttempts, CU.IsLocked, S.SellerID
+            SELECT CU.PasswordHash,
+                   CU.FailedAttempts,
+                   CU.IsLocked,
+                   S.SellerID,
+                   Org.OrganizationID
             FROM ClientUsers CU
             INNER JOIN Sellers S ON S.SellerID = CU.SellerID
+            INNER JOIN Organizations Org ON Org.LegacySellerID = S.SellerID
             WHERE CU.Username = ? AND S.Email = ?
             """,
             (self.identity["username"], self.identity["email"]),
@@ -116,6 +121,9 @@ class SQLIntegrationTests(unittest.TestCase):
         self.assertNotEqual(user_row.PasswordHash, self.identity["password"])
         self.assertTrue(dukaan.check_password_hash(user_row.PasswordHash, self.identity["password"]))
         seller_id = int(user_row.SellerID)
+        organization_id = str(user_row.OrganizationID)
+        with owner_client.session_transaction() as current_session:
+            self.assertEqual(current_session["user"]["organization_id"], organization_id)
 
         owner_client, login_response = self.login(self.identity)
         self.assertEqual(login_response.status_code, 302)
@@ -132,6 +140,18 @@ class SQLIntegrationTests(unittest.TestCase):
             }
         )
         self.signup(locked_identity)
+        locked_organization_id = str(
+            self.query_one(
+                """
+                SELECT Org.OrganizationID
+                FROM Organizations Org
+                INNER JOIN Sellers S ON S.SellerID = Org.LegacySellerID
+                WHERE S.DomainName = ?
+                """,
+                (locked_identity["domain"],),
+            )[0]
+        )
+        self.assertNotEqual(locked_organization_id, organization_id)
         for _ in range(3):
             _, failed_response = self.login(locked_identity, "definitely-wrong")
             self.assertEqual(failed_response.status_code, 200)
@@ -285,6 +305,41 @@ class SQLIntegrationTests(unittest.TestCase):
         )[0]
         self.assertEqual(isolated_status, "Pending")
 
+        organization_guard_buyer = f"Organization Guard Buyer {self.identity['token']}"
+        self.place_order(self.identity, organization_guard_buyer, "33.00")
+        organization_guard_order_id = int(
+            self.query_one(
+                "SELECT OrderID FROM Orders WHERE SellerID = ? AND BuyerName = ?",
+                (seller_id, organization_guard_buyer),
+            )[0]
+        )
+        with owner_client.session_transaction() as current_session:
+            session_user = dict(current_session["user"])
+            session_user["organization_id"] = locked_organization_id
+            current_session["user"] = session_user
+        mismatched_dashboard = owner_client.get("/dashboard")
+        self.assertEqual(mismatched_dashboard.status_code, 200)
+        self.assertNotIn(organization_guard_buyer.encode(), mismatched_dashboard.data)
+        mismatched_update = owner_client.post(
+            f"/orders/{organization_guard_order_id}/action",
+            data={
+                "csrf_token": self.csrf(owner_client),
+                "action": "confirm",
+                "organization_id": organization_id,
+                "search": "",
+            },
+        )
+        self.assertEqual(mismatched_update.status_code, 302)
+        guarded_status = self.query_one(
+            "SELECT OrderStatus FROM Orders WHERE OrderID = ?",
+            (organization_guard_order_id,),
+        )[0]
+        self.assertEqual(guarded_status, "Pending")
+        with owner_client.session_transaction() as current_session:
+            session_user = dict(current_session["user"])
+            session_user["organization_id"] = organization_id
+            current_session["user"] = session_user
+
         dashboard_response = owner_client.get("/dashboard")
         self.assertEqual(dashboard_response.status_code, 200)
         self.assertNotIn(isolated_buyer.encode(), dashboard_response.data)
@@ -302,6 +357,72 @@ class SQLIntegrationTests(unittest.TestCase):
             """
         )
         self.assertEqual(constraint_row[0], 1)
+
+    def test_organization_backfill_constraints_and_immutable_mapping(self):
+        mapping_counts = self.query_one(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM Sellers) AS SellerCount,
+                (SELECT COUNT(*) FROM Organizations) AS OrganizationCount,
+                (
+                    SELECT COUNT(*)
+                    FROM Sellers S
+                    LEFT JOIN Organizations Org ON Org.LegacySellerID = S.SellerID
+                    WHERE Org.OrganizationID IS NULL
+                ) AS MissingMappings,
+                (
+                    SELECT COUNT(*)
+                    FROM (
+                        SELECT LegacySellerID
+                        FROM Organizations
+                        GROUP BY LegacySellerID
+                        HAVING COUNT(*) <> 1
+                    ) Duplicates
+                ) AS DuplicateMappings
+            """
+        )
+        self.assertEqual(int(mapping_counts.SellerCount), int(mapping_counts.OrganizationCount))
+        self.assertEqual(int(mapping_counts.MissingMappings), 0)
+        self.assertEqual(int(mapping_counts.DuplicateMappings), 0)
+
+        schema_state = self.query_one(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM sys.key_constraints
+                 WHERE name = 'PK_Organizations') AS PrimaryKeyCount,
+                (SELECT COUNT(*) FROM sys.key_constraints
+                 WHERE name = 'UQ_Organizations_LegacySellerID') AS UniqueMappingCount,
+                (SELECT COUNT(*) FROM sys.foreign_keys
+                 WHERE name = 'FK_Organizations_Sellers'
+                   AND is_disabled = 0 AND is_not_trusted = 0) AS TrustedForeignKeyCount,
+                (SELECT COUNT(*) FROM sys.triggers
+                 WHERE name = 'trg_Organizations_ImmutableIdentity'
+                   AND is_disabled = 0) AS EnabledTriggerCount
+            """
+        )
+        self.assertEqual(tuple(int(value) for value in schema_state), (1, 1, 1, 1))
+
+        seller_id = int(self.query_one("SELECT MIN(SellerID) FROM Sellers")[0])
+        cursor = self.connection.cursor()
+        with self.assertRaises(dukaan.pyodbc.Error):
+            cursor.execute(
+                """
+                UPDATE Organizations
+                SET LegacySellerID = LegacySellerID
+                WHERE LegacySellerID = ?
+                """,
+                (seller_id,),
+            )
+        self.connection.rollback()
+        self.assertEqual(
+            int(
+                self.query_one(
+                    "SELECT COUNT(*) FROM Organizations WHERE LegacySellerID = ?",
+                    (seller_id,),
+                )[0]
+            ),
+            1,
+        )
 
     def test_concurrent_seller_number_allocation(self):
         self.signup(self.identity)
