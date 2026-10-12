@@ -168,17 +168,25 @@ Important environment variables are documented in `README.md`. `SESSION_SECRET` 
 
 ## Verification status
 
-Verified without a database on 2026-10-12:
+Verified offline on 2026-10-12:
 
-- `python -m py_compile app.py tests/test_app.py`
-- `python -m unittest discover -s tests -v`: 16 passing tests.
-- `python -m pytest -q -p no:cacheprovider`: 16 passed, including 5 invalid-amount subtests.
+- `python -m py_compile app.py tests/test_app.py tests/test_sql_integration.py`.
+- `python -m pytest -q -p no:cacheprovider`: 16 passed, 2 guarded SQL tests skipped, and 5 invalid-amount subtests passed.
 - Public GET pages render; protected pages redirect; missing CSRF receives HTTP 400; security headers are present.
+- `python -m pip check` reported no broken requirements, and `git diff --check` passed.
+
+Verified with SQL Server on 2026-10-12:
+
+- SQL Server 17.0 Standard Developer Edition at `localhost\MSSQLSERVER01`, using Windows Authentication, ODBC Driver 18, `DB_ENCRYPT=true`, and `DB_TRUST_SERVER_CERTIFICATE=true`.
+- A read-only master query confirmed zero non-system databases and that `DukaanDesk_Test` was absent. The guarded schema was adapted in memory to create only `DukaanDesk_Test`; `CODManager` remained absent.
+- Fresh setup created five user tables, `vw_PendingConfirmations`, and `trg_AutoLogCreation` with zero initial rows. Neither `3_DataTesting.sql` nor `reset.sql` was executed.
+- The SQL-enabled suite passed 18 tests total: 16 offline tests plus two guarded real-database tests. It verified signup, scrypt password storage, hashed login, real legacy-plaintext upgrade, persistent three-attempt lockout, public order creation, confirmation, cancellation, delivery, seller isolation, dashboard/summary output, exact trigger/action/delivery log messages, and four concurrent seller-relative buyer/order allocations.
+- Read-only migration preflight on populated synthetic data found zero invalid order states, zero cross-seller orders, and zero legacy credential values. The non-destructive `5_Migration.sql` completed successfully after in-memory database-name substitution; the tenant foreign key and all four order checks remained enabled and trusted.
+- Final database audit showed only `DukaanDesk_Test` outside the four system databases. Its objects were healthy; integration tests intentionally left only uniquely named synthetic rows and performed no cleanup deletes.
 
 Not verified in the current environment:
 
-- Real SQL Server schema/migration execution, trigger behavior, or SQL-backed end-to-end flows. No `DB_*` configuration was present; a read-only connection attempt to the default endpoint failed with pyodbc SQLSTATE `08001`.
-- Linux/Codespace ODBC driver installation. The inspected host exposed both ODBC Driver 17 and 18 on Windows, but the actual target Codespace must be checked separately.
+- Linux/Codespace ODBC driver installation and SQL connectivity; this verification used the local Windows instance and shared-memory `sqlcmd` transport.
 - HTTPS/proxy behavior, multi-process session behavior, production WSGI serving, or deployment.
 - Browser visual QA beyond template rendering.
 
@@ -190,3 +198,7 @@ Not verified in the current environment:
 4. Keep current MVP fixes separate from the future multi-store/RBAC/subscription redesign.
 5. Any real connector work needs signed webhook ingestion, idempotency keys, provider credential encryption, store-level tenant boundaries, retry/dead-letter handling, and reconciliation before it can be called reliable.
 6. Update this file, `README.md`, tests, and `ROADMAP.md` whenever routes, state rules, schema, or verified runtime status changes.
+
+## Phase 2.1 gate
+
+Status: **ready to begin Phase 2.1 design and isolated development from the verified MVP baseline**. The disposable-database gate now covers signup, hashed and legacy-upgrade login, lockout, order creation, both order decisions, delivery outcomes, tenant isolation, concurrent numbering, the insert trigger, message-log transactions, summaries, and migration compatibility. This is not production-launch readiness: the remaining P0 identity, abuse prevention, runtime/operations, and independent security-review work still applies.

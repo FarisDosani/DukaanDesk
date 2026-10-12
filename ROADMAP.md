@@ -32,13 +32,20 @@ This direction is intentionally not implemented in the current security/MVP pass
 
 Completion here means code/tests were verified without SQL Server. It does not mean the migration or SQL-backed flows have been executed.
 
+## Verification checkpoint — 2026-10-12
+
+- Offline verification is green: 16 tests pass, two guarded SQL tests skip by default, and five invalid-amount subtests pass. Compilation and dependency checks pass.
+- SQL verification is green: the full suite reports 18 passed against the confirmed disposable `DukaanDesk_Test` database on `localhost\MSSQLSERVER01`.
+- Signup, password hashing, hashed login, legacy-plaintext upgrade, lockout, order creation, confirmation/cancellation, delivery, tenant isolation, exact message logs, summaries, and concurrent seller-relative numbering were exercised against real SQL Server.
+- Read-only migration preflight found no invalid or cross-seller rows. The non-destructive migration completed on populated test data and retained enabled/trusted constraints. Seed and reset scripts were not run; `CODManager` remained absent.
+- **Phase 2.1 MVP-verification gate is open.** Multi-tenant design and isolated development may begin, while the remaining launch P0 items stay mandatory before production.
+
 ## P0 — required before any real launch
 
-1. **Verify on a disposable SQL Server clone**
-   - Back up existing data.
-   - Run read-only preflight queries from `5_Migration.sql`.
-   - Apply `5_Migration.sql` and `2_Logic.sql` only to the clone first.
-   - Exercise signup, hashed and legacy login, lockout, public order creation, concurrent numbering, all valid/invalid state transitions, message logs, dashboard search, and summaries.
+1. **Verify on a disposable SQL Server clone — completed 2026-10-12**
+   - Created only the previously absent `DukaanDesk_Test`; no existing database was overwritten.
+   - Installed the fresh schema/view/trigger, ran read-only migration preflight, and applied the non-destructive migration successfully.
+   - Verified signup, hashed login, legacy-password upgrade, lockout, public order creation, concurrent numbering, valid/rejected state transitions, tenant isolation, message logs, dashboard behavior, and summaries.
 
 2. **Remove remaining legacy plaintext exposure**
    - Inventory `ClientUsers.PasswordHash` without printing credential values.

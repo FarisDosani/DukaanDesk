@@ -163,9 +163,53 @@ python -m py_compile app.py tests/test_app.py
 python -m pip check
 ```
 
+### Disposable SQL Server integration test
+
+The integration suite has a hard safety gate: it skips unless `RUN_SQL_INTEGRATION_TESTS=1` and `DB_NAME` is exactly `DukaanDesk_Test`; it also verifies `DB_NAME()` before writing. It creates uniquely named synthetic rows and does not delete existing rows.
+
+PowerShell configuration for the verified local instance:
+
+```powershell
+$env:DB_SERVER = "localhost\MSSQLSERVER01"
+$env:DB_NAME = "DukaanDesk_Test"
+$env:DB_ENCRYPT = "true"
+$env:DB_TRUST_SERVER_CERTIFICATE = "true"
+$env:SESSION_SECRET = "integration-test-only"
+$env:RUN_SQL_INTEGRATION_TESTS = "1"
+
+python -m pytest tests/test_sql_integration.py -q -p no:cacheprovider -vv
+python -m pytest -q -p no:cacheprovider
+```
+
+For a first-time setup only, first confirm that the target is absent with a read-only query. The existing schema aborts if the substituted target already exists:
+
+```powershell
+sqlcmd -S "lpc:localhost\MSSQLSERVER01" -E -N -C -d master -Q "SELECT name FROM sys.databases WHERE name = N'DukaanDesk_Test';"
+
+$schemaText = (Get-Content -LiteralPath "1_Schema.sql" -Raw).Replace("CODManager", "DukaanDesk_Test")
+$schemaText | sqlcmd -S "lpc:localhost\MSSQLSERVER01" -E -N -C -b -d master
+
+$logicText = (Get-Content -LiteralPath "2_Logic.sql" -Raw).Replace("CODManager", "DukaanDesk_Test")
+$logicText | sqlcmd -S "lpc:localhost\MSSQLSERVER01" -E -N -C -b -d master
+```
+
+Do not run those setup commands when `DukaanDesk_Test` already exists. Never substitute an existing or production database name. `3_DataTesting.sql` and `reset.sql` are not needed for integration verification.
+
+### Latest verification status (2026-10-12)
+
+- Offline suite: 16 passed, 2 SQL tests safely skipped, and 5 invalid-amount subtests passed.
+- SQL-enabled complete suite: 18 passed, including 2 real SQL integration tests and 5 invalid-amount subtests.
+- `python -m py_compile app.py tests/test_app.py tests/test_sql_integration.py`: passed.
+- `python -m pip check`: no broken requirements.
+- Flask test-client smoke check: login, signup, and storefront pages returned HTTP 200; protected pages redirected; a POST without CSRF returned HTTP 400; security headers were present.
+- SQL Server 17.0 Standard Developer Edition at `localhost\MSSQLSERVER01` was verified with Windows Authentication, ODBC Driver 18, encrypted transport, and trusted local certificate.
+- `DukaanDesk_Test` was confirmed absent, created once, and initialized with five tables, four trusted order checks, the trusted composite tenant foreign key, `vw_PendingConfirmations`, and `trg_AutoLogCreation`. `CODManager` was not created or modified.
+- Real SQL tests passed for signup, scrypt storage, hashed login, legacy-plaintext upgrade on successful login, three-attempt lockout, order creation, confirmation, cancellation, delivery, tenant isolation, trigger/audit messages, summaries, and four-way concurrent seller-relative numbering.
+- Migration preflight found zero invalid order states and zero cross-seller orders. The non-destructive migration completed successfully on populated disposable data and retained trusted constraints. Seed and reset scripts were not run.
+
 ## Known limitations
 
-- SQL Server-backed end-to-end behavior has not been verified in the current environment because no database endpoint/configuration is available.
+- SQL integration has been verified only on the local disposable `DukaanDesk_Test` database; production deployment and other SQL Server environments remain unverified.
 - Passwords left as legacy plaintext remain so until that user successfully logs in; a forced reset/migration flow is still needed before real launch.
 - Account unlock is manual; there is no password reset, email verification, MFA, or administrative recovery workflow.
 - Public order submission has no rate limiting, bot protection, webhook authentication, product catalog, inventory, taxes, shipping calculation, or payment integration.
