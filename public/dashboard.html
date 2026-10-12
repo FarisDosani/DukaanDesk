@@ -9,7 +9,8 @@
 <body>
     <nav class="floating-nav" aria-label="Seller navigation">
         <a class="nav-link active" href="/dashboard" aria-current="page">Current Orders</a>
-        <a class="nav-link" href="/summary">Summary</a>
+        {% if can('summary.view') %}<a class="nav-link" href="/summary">Summary</a>{% endif %}
+        {% if can('members.view') %}<a class="nav-link" href="/organization/members">Members</a>{% endif %}
     </nav>
     <main class="page-shell">
         <header class="surface topbar dashboard-topbar">
@@ -104,7 +105,7 @@
                                     </td>
                                     <td>{{ order.DeliveryAddress or '-' }}</td>
                                     <td>
-                                        {% if order.OrderStatus == 'Pending' %}
+                                        {% if order.OrderStatus == 'Pending' and can('orders.decide') %}
                                             <form method="post" action="/orders/{{ order.OrderID }}/action" class="table-inline-form">
                                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                                                 <input type="hidden" name="search" value="{{ search }}" />
@@ -117,12 +118,14 @@
                                             </form>
                                         {% elif order.OrderStatus == 'Confirmed' %}
                                             <span class="status-chip action-confirmed">Confirmed</span>
+                                        {% elif order.OrderStatus == 'Pending' %}
+                                            <span class="status-chip muted">Pending review</span>
                                         {% else %}
                                             <span class="status-chip muted">Action completed</span>
                                         {% endif %}
                                     </td>
                                     <td>
-                                        {% if order.OrderStatus == 'Confirmed' and (order.DeliveryStatus or 'Pending') == 'Pending' %}
+                                        {% if order.OrderStatus == 'Confirmed' and (order.DeliveryStatus or 'Pending') == 'Pending' and can('orders.delivery') %}
                                             <form method="post" action="/orders/{{ order.OrderID }}/status" class="table-inline-form">
                                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                                                 <input type="hidden" name="search" value="{{ search }}" />

@@ -1,9 +1,9 @@
-{% if g.organization_memberships|default([])|length > 1 %}
+{% if can('organizations.switch') and g.organization_memberships|default([])|length > 1 %}
 <form method="post" action="{{ url_for('switch_organization') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
     <label for="organization-select">Organization</label>
     <select id="organization-select" name="organization_id">
-        {% for membership in g.organization_memberships %}
+        {% for membership in g.organization_memberships if membership.role_name %}
         <option value="{{ membership.organization_id }}" {% if membership.organization_id == user.organization_id %}selected{% endif %}>{{ membership.business_name }}</option>
         {% endfor %}
     </select>

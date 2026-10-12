@@ -30,10 +30,14 @@ class FakeConnection:
 
 
 class SequenceCursor:
-    def __init__(self, fetch_results=(), rowcount=1):
+    def __init__(self, fetch_results=(), rowcount=1, permissions=None):
         self.fetch_results = list(fetch_results)
         self.rowcount = rowcount
         self.executions = []
+        self.permissions = permissions if permissions is not None else (
+            'dashboard.view', 'summary.view', 'orders.decide', 'orders.delivery',
+            'organizations.switch', 'members.view', 'members.roles',
+        )
 
     def execute(self, sql, params=()):
         self.executions.append((sql, params))
@@ -43,6 +47,8 @@ class SequenceCursor:
         return self.fetch_results.pop(0) if self.fetch_results else None
 
     def fetchall(self):
+        if "SELECT Permission FROM RolePermissions" in self.executions[-1][0]:
+            return [(permission,) for permission in self.permissions]
         rows, self.fetch_results = self.fetch_results, []
         return rows
 
@@ -249,6 +255,7 @@ class DukaanDeskTests(unittest.TestCase):
         row = SimpleNamespace(
             UserID=3,
             GlobalUserID=30,
+            RoleName="Owner",
             Username="owner",
             PasswordHash="legacy-secret",
             FailedAttempts=0,
@@ -369,7 +376,7 @@ class DukaanDeskTests(unittest.TestCase):
     def membership_row(self, **changes):
         values = dict(UserID=7, GlobalUserID=70, SellerID=42,
                       OrganizationID=self.TEST_ORGANIZATION_ID, Email="owner@example.com",
-                      Username="owner", BusinessName="Test Shop", DomainName="test.local")
+                      Username="owner", BusinessName="Test Shop", DomainName="test.local", RoleName="Owner")
         values.update(changes)
         return SimpleNamespace(**values)
 
@@ -399,13 +406,52 @@ class DukaanDeskTests(unittest.TestCase):
             with patch.object(dukaan, "get_db_connection", return_value=FakeConnection(SequenceCursor([self.membership_row()]))):
                 self.assertEqual(self.client.post("/organizations/switch", data={"csrf_token": token, "organization_id": requested}).status_code, expected)
         rows = [self.membership_row(), self.membership_row(SellerID=43, OrganizationID=target, BusinessName="Second Shop")]
-        with patch.object(dukaan, "get_db_connection", return_value=FakeConnection(SequenceCursor(rows))):
+        with patch.object(dukaan, "get_db_connection", side_effect=[
+            FakeConnection(SequenceCursor(rows)), FakeConnection(SequenceCursor([(1,)]))
+        ]):
             response = self.client.post("/organizations/switch", data={"csrf_token": token, "organization_id": target, "seller_id": 999})
         self.assertEqual(response.status_code, 302)
         with self.client.session_transaction() as current_session:
             self.assertEqual(current_session["user"]["seller_id"], 43)
             self.assertEqual(current_session["user"]["global_user_id"], 70)
             self.assertNotEqual(current_session["csrf_token"], token)
+
+    def test_each_role_permission_and_unknown_role_deny_default(self):
+        expected = {
+            "Owner": {'dashboard.view','summary.view','orders.decide','orders.delivery','organizations.switch','members.view','members.roles'},
+            "Admin": {'dashboard.view','summary.view','orders.decide','orders.delivery','organizations.switch','members.view'},
+            "Operations": {'dashboard.view','orders.decide','orders.delivery','organizations.switch'},
+            "Finance": {'dashboard.view','summary.view','organizations.switch'},
+            "Marketing": {'dashboard.view','summary.view','organizations.switch'},
+            "Support": {'dashboard.view','organizations.switch'},
+            None: set(),
+        }
+        for role, permissions in expected.items():
+            for permission in expected['Owner'] | {'unknown.permission'}:
+                with self.subTest(role=role, permission=permission):
+                    cursor = SequenceCursor([self.membership_row(RoleName=role)], permissions=permissions)
+                    with dukaan.app.test_request_context('/dashboard'):
+                        dukaan.session['user'] = {'id':7, 'global_user_id':70, 'seller_id':42,
+                            'organization_id':self.TEST_ORGANIZATION_ID, 'permissions':['members.roles']}
+                        endpoint = dukaan.require_permission(permission)(lambda: 'allowed')
+                        with patch.object(dukaan, 'get_db_connection', return_value=FakeConnection(cursor)):
+                            if permission in permissions:
+                                self.assertEqual(endpoint(), 'allowed')
+                            else:
+                                from werkzeug.exceptions import Forbidden
+                                with self.assertRaises(Forbidden):
+                                    endpoint()
+
+    def test_role_change_revalidated_without_relogin(self):
+        token = self.sign_in_session()
+        for role, permissions, expected in (
+            ('Operations', ['orders.decide'], 302),
+            ('Support', ['dashboard.view'], 403),
+        ):
+            with patch.object(dukaan, 'get_db_connection', return_value=FakeConnection(
+                    SequenceCursor([self.membership_row(RoleName=role)], permissions=permissions))):
+                response = self.client.post('/orders/9/action', data={'csrf_token':token, 'action':'invalid'})
+            self.assertEqual(response.status_code, expected)
 
     def test_kpis_only_count_delivered_revenue(self):
         orders = [

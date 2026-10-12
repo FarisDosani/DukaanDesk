@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Members | DukaanDesk</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+    <nav class="floating-nav" aria-label="Organization navigation">
+        {% if can('dashboard.view') %}<a class="nav-link" href="/dashboard">Current Orders</a>{% endif %}
+        {% if can('summary.view') %}<a class="nav-link" href="/summary">Summary</a>{% endif %}
+        <a class="nav-link active" href="/organization/members" aria-current="page">Members</a>
+    </nav>
+    <main class="page-shell">
+        <header class="surface topbar">
+            <h2>{{ user.business_name }} | Members</h2>
+            {% include '_organization_selector.html' %}
+            <form method="post" action="/logout">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                <button class="btn-secondary" type="submit">Logout</button>
+            </form>
+        </header>
+        <section class="surface orders" aria-label="Organization members">
+            <p>Only an Owner can assign roles to existing active members. Keep at least one active Owner.</p>
+            <div class="table-wrap"><table>
+                <thead><tr><th>Username</th><th>Membership</th><th>Role</th><th>Change role</th></tr></thead>
+                <tbody>{% for member in members %}
+                    <tr><td>{{ member.Username }}</td><td>{{ member.Status }}</td><td>{{ member.RoleName or 'Unassigned' }}</td><td>
+                        {% if can('members.roles') and member.Status == 'Active' %}
+                        <form method="post" action="{{ url_for('change_member_role', member_id=member.UserID) }}">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                            <select name="role" aria-label="Role for {{ member.Username }}">
+                                {% for role in roles %}<option {% if role == member.RoleName %}selected{% endif %}>{{ role }}</option>{% endfor %}
+                            </select>
+                            <button class="btn-tertiary" type="submit">Save role</button>
+                        </form>
+                        {% endif %}
+                    </td></tr>
+                {% endfor %}</tbody>
+            </table></div>
+        </section>
+    </main>
+</body>
+</html>

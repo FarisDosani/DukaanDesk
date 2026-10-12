@@ -10,6 +10,7 @@
     <nav class="floating-nav" aria-label="Seller navigation">
         <a class="nav-link" href="/dashboard">Current Orders</a>
         <a class="nav-link active" href="/summary" aria-current="page">Summary</a>
+        {% if can('members.view') %}<a class="nav-link" href="/organization/members">Members</a>{% endif %}
     </nav>
     <main class="page-shell">
         <header class="surface topbar dashboard-topbar">

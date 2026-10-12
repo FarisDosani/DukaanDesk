@@ -8,7 +8,7 @@ This document is the implementation handoff for future developers and AI assista
 
 Current MVP: immutable `Organizations` tenants mapped one-to-one to legacy sellers, global `Users` with active organization memberships, one unique domain per signup, domain-scoped public COD order intake, seller order decisions, delivery outcomes, and reporting. A user can switch among existing active memberships; there is no membership provisioning UI or API.
 
-Long-term vision: a multi-tenant B2B SaaS where each business can connect multiple existing Shopify, WooCommerce, or custom stores; invite employees with role-based permissions; operate orders and analytics across those stores; and be managed by a platform super admin with subscription/billing controls. None of the connector, multi-store, RBAC, super-admin, or subscription architecture exists yet. Do not describe it as implemented.
+Long-term vision: businesses connect multiple Shopify, WooCommerce, or custom stores and invite employees, with platform administration and subscriptions. Global users, memberships, and six organization-scoped roles are implemented; invitations, connectors, multiple stores, super-admin, and billing are not.
 
 ## Runtime architecture
 
@@ -29,6 +29,7 @@ app.py (single Flask process)
 Microsoft SQL Server / CODManager
   ├─ Organizations ── Sellers ── ClientUsers
   ├─ Users ── OrganizationMemberships ── Organizations
+  ├─ OrganizationMemberships ── Roles ── RolePermissions
   ├─ Users ── one-to-one legacy ClientUsers mapping
   ├─ Sellers ── Buyers ── Orders
   ├─ Orders ── MessageLogs
@@ -53,6 +54,7 @@ There is no JSON API, SPA, background worker, queue, cache, external identity pr
 - `tests/test_app.py`: database-free unit/route tests using fake pyodbc connections.
 - `tests/test_sql_integration.py`: guarded real-SQL migration, identity, membership, and MVP tests; captures pre-existing row values without logging secrets.
 - `public/_organization_selector.html`: shared CSRF-protected selector, displayed only for multiple active memberships.
+- `public/members.html`: Owner/Admin roster; Owner-only role-assignment controls for existing active memberships.
 - `1_Schema.sql`: fresh `CODManager` installer. It aborts when the database already exists.
 - `2_Logic.sql`: creates/updates the pending view and a multi-row-safe insert trigger.
 - `3_DataTesting.sql`: idempotent local seed; it does not delete existing rows.
@@ -60,6 +62,7 @@ There is no JSON API, SPA, background worker, queue, cache, external identity pr
 - `5_Migration.sql`: additive, transactional hardening for an existing database. It aborts on inconsistent rows.
 - `6_Organizations.sql`: additive, idempotent organization migration. It backfills one tenant per seller and installs immutable-identity protection.
 - `7_UsersMemberships.sql`: additive transactional global identity/membership migration; must run in an explicitly selected application database after Phase 2.1 (also required after a fresh schema).
+- `8_OrganizationRoles.sql`: additive role catalog/grants and membership RoleName foreign key, with conservative founder backfill; required after migration 7 for both fresh and existing installations.
 - `reset.sql`: legacy-only unlock helper; no longer suitable for current authentication, whose authority is `Users`.
 - `checking.sql`: pre-existing user-owned ad-hoc seller query. It is not part of setup.
 - `package.json` / `package-lock.json`: legacy Node dependencies are unused. `npm start` and `npm test` now delegate to Python for convenience.
@@ -70,6 +73,8 @@ There is no JSON API, SPA, background worker, queue, cache, external identity pr
 - `GET|POST /login`: retains email/username/password login, authenticates against `Users`, and chooses an active membership (preferring the legacy seller organization). Successful login rotates the session and establishes an eight-hour permanent session.
 - `GET|POST /signup`: atomically creates seller, organization, legacy account, global user, and initial active membership. Existing domains/WhatsApp numbers and duplicate global emails/usernames are rejected. It cannot attach a user to an existing organization.
 - `POST /organizations/switch`: validates a UUID selection against the requesting user's freshly queried active memberships, then rotates session and CSRF state. Unauthorized selections receive 403; malformed IDs receive 400. No membership is created.
+- `GET /organization/members`: requires `members.view`; returns only the current organization's roster.
+- `POST /organization/members/<user_id>/role`: requires `members.roles`; assigns an existing role to an active membership in the current organization. Unknown role = 400, unauthorized = 403, absent/inactive/cross-tenant target = 404, last-owner demotion = 409. Organization-level SQL locks serialize administration and preserve an active, unlocked Owner through this endpoint.
 - `POST /logout`: clears the session.
 - `GET /dashboard`: requires authentication; loads only orders matching both the signed server-derived organization context and its legacy seller ID, then displays operational orders whose state is pending confirmation or confirmed/awaiting delivery.
 - `GET /summary`: requires authentication; loads all organization-and-seller-scoped orders and groups terminal outcomes over the latest twelve calendar months.
@@ -96,15 +101,30 @@ Immutable SaaS tenant identity: GUID `OrganizationID`, unique `LegacySellerID`, 
 
 Legacy account linked to `SellerID`: globally unique `Username`, `PasswordHash`, failed-attempt count, lock flag, last-failure timestamp, and creation timestamp. Rows and keys remain intact for compatibility. Authentication now reads `Users`; app login updates mirror credential and lockout fields back into this table in the same transaction. Legacy-only updates no longer change the authoritative credential.
 
-The current UI creates only the first user for a new seller. A secure invitation and RBAC workflow is intentionally deferred.
+Signup creates only the first user for a new seller. Role assignment to existing active memberships is implemented; secure invitations and membership provisioning remain deferred.
 
 ### Users and OrganizationMemberships
 
 `Users.UserID` is the global integer identity. `LegacyClientUserID` is a required unique foreign key to `ClientUsers.UserID`; a trigger rejects identity/remapping updates. Unique `Username` and computed persisted `NormalizedEmail` (trim/lowercase) prevent duplicate global identities. PasswordHash, FailedAttempts, IsLocked, LastFailedAt, and CreatedAt are copied exactly at migration. `IsActive` can disable the global account. Authentication uses Werkzeug hashes with the existing successful-login legacy plaintext upgrade and three-attempt lockout; a locked SQL read serializes login failure updates.
 
-`OrganizationMemberships` has composite primary key `(UserID, OrganizationID)`, two non-cascading foreign keys, CreatedAt, and a constrained Status (`Active`, `Inactive`, `Revoked`). The default is Inactive; migration and new-business signup explicitly create Active membership. There are no roles: an active member currently receives the existing seller order/reporting capabilities. Active membership is verified from the database; email verification is still absent.
+`OrganizationMemberships` has composite primary key `(UserID, OrganizationID)`, non-cascading user/organization foreign keys, CreatedAt, constrained Status (`Active`, `Inactive`, `Revoked`), and nullable RoleName referencing Roles. The default status is Inactive; migration 7 and signup explicitly create Active membership. Active membership alone no longer authorizes protected operations: a corresponding role grant is required. Email verification is still absent.
 
 Migration 7 runs without a `USE` directive and refuses system databases. Preflight aborts on ambiguous normalized legacy seller emails, missing organizations, invalid failure counts, partial identity schema, or missing/untrusted expected constraints. One global user is created per unmapped legacy account, with its legacy organization membership. It never merges by email. Multiple legacy users sharing a business email require manual identity/ownership resolution before migration; this deployment had zero such groups. Reruns preserve existing user state and memberships, including revoked or removed memberships; no automatic reactivation occurs. Stop old application processes during migration because older versions write only ClientUsers.
+
+### Roles and explicit permissions (Phase 2.3)
+
+Roles are a shared catalog of six fixed names; authority is scoped by each organization's membership assignment. RolePermissions stores explicit grants with a composite primary key and constrained permission names. No global user role exists. `require_permission` wraps authentication and denies absent grants; `resolve_legacy_organization_context` reloads the role and grants from SQL every protected request. `g.permissions` is request-local; session/form role claims cannot grant access. Order reads/writes and roster reads also check RolePermissions in SQL. The role-change endpoint rechecks the actor inside its locked transaction.
+
+- Owner: dashboard.view, summary.view, orders.decide, orders.delivery, organizations.switch, members.view, members.roles.
+- Admin: all Owner grants except members.roles.
+- Operations: dashboard.view, orders.decide, orders.delivery, organizations.switch.
+- Finance and Marketing: dashboard.view, summary.view, organizations.switch.
+- Support: dashboard.view, organizations.switch.
+- Null/unassigned role or unknown permission: deny. Demo receives only the four existing operational permissions in isolated memory, with no management/switch permission.
+
+Migration 8 only assigns Owner on first introduction of RoleName, where an organization's sole legacy ClientUser maps through Users to that membership. Multiple historical accounts and extra cross-organization memberships are not inferred to be founders. Status/credentials and existing operational rows remain untouched. Reruns preserve all assignments (including NULL), validate exact permission policy, and fail closed on policy drift. Legacy users imported through migration 7 after RBAC exists need manual role review; signup explicitly creates an Owner membership. An organization without a verified Owner requires authorized administrative resolution, not an automatic ownership guess.
+
+The dashboard currently exposes existing contact details and revenue KPIs to every defined role; finer data minimization is not implemented. Management only assigns roles: no invitation, membership creation/reactivation, or role-change audit history exists. Last-owner protection covers the app endpoint, not unrestricted direct SQL administration.
 
 ### Buyers
 
@@ -140,7 +160,7 @@ Weak child entity keyed by `(LogID, OrderID)`. The trigger logs initial order cr
 
 1. Normalize email/domain and validate field lengths/formats plus a 10-character minimum password.
 2. Reject an existing domain or WhatsApp number. Database unique constraints also guard races and email/username duplication.
-3. Insert seller, organization, scrypt-hashed legacy account, global user, and active initial membership in one transaction.
+3. Insert seller, organization, scrypt-hashed legacy account, global user, and active Owner membership in one transaction.
 4. Rotate into an authenticated seller session.
 
 ### Login
@@ -192,7 +212,7 @@ Important environment variables are documented in `README.md`. `SESSION_SECRET` 
 Verified offline on 2026-10-12:
 
 - `python -m py_compile app.py tests/test_app.py tests/test_sql_integration.py`.
-- Phase 2.2 offline tests: 21 tests pass with 10 subtests. The seven SQL tests require explicit opt-in.
+- Phase 2.3 offline tests: 23 tests pass with 66 subtests. Ten SQL tests require explicit opt-in.
 - Public GET pages render; protected pages redirect; missing CSRF receives HTTP 400; security headers are present.
 - `python -m pip check` reported no broken requirements, and `git diff --check` passed.
 
@@ -214,6 +234,14 @@ Phase 2.2 SQL verification on 2026-10-12:
 - Every row present before each test run in legacy tables and existing global identity tables was preserved by full-row subset checks. New synthetic fixtures remain, including inactive users and revoked memberships; aborted inserts may leave identity-number gaps.
 - Final counts: 35 sellers/organizations/legacy accounts/global users, 37 memberships (35 active and 2 revoked), 48 buyers, 60 orders, and 89 logs. Zero missing user mappings, ambiguous email groups, or disabled/untrusted identity foreign keys.
 
+Phase 2.3 SQL verification on 2026-10-12:
+
+- Preflight found 42 users/organizations, 45 memberships, 69 orders, and 102 logs. All 42 founder mappings had a sole legacy account; no ambiguous founders existed. The three extra memberships were not promoted. Migration added the role column/FK and two policy tables only, assigning Owner to the 42 clear founders without changing status or credential/operational data.
+- First-run backfill was additionally tested with a rollback-only two-legacy-account organization; both memberships remained unassigned. The fixture and its transactional new DDL were rolled back, then the additive migration was applied to the real disposable baseline.
+- Final suite: 33 passed with 72 subtests (23 offline and 10 SQL tests). SQL coverage exercises every role against protected routes and UI controls, active switching, direct unauthorized POSTs, role changes without re-login, roleless denial, current-organization role management, cross-tenant targets, last-owner protection, idempotence, and policy-drift transactional rollback. No test failures occurred.
+- Full legacy/identity row preservation checks passed. Existing role assignments also survived subsequent runs. Final disposable counts: 60 sellers/organizations/legacy accounts/global users, 67 memberships, 73 buyers, 125 orders, 196 logs. Roles: 58 Owner, 2 Admin, 2 Operations, 5 unassigned. The five unassigned records include additional memberships and post-RBAC locked-account import fixtures. The role FK is trusted/enabled; no ambiguous founder groups remain in persisted test data.
+- No CODManager/system database operation, seed/reset, cleanup delete, Git commit/push, or deployment occurred in this phase. Tests leave uniquely named synthetic records; rolled-back inserts may leave identity gaps.
+
 Not verified in the current environment:
 
 - Linux/Codespace ODBC driver installation and SQL connectivity; this verification used the local Windows instance and shared-memory `sqlcmd` transport.
@@ -224,11 +252,11 @@ Not verified in the current environment:
 
 1. Preserve uncommitted user changes. At audit time, branding edits in all HTML pages, `checking.sql`, and a tracked `.pyc` modification predated the security work.
 2. Do not run `reset.sql`, delete rows, drop databases, or execute a migration without the user's confirmation and a backup.
-3. Before SQL verification, inspect the target and run read-only consistency/mapping/duplicate-email checks for migrations 5, 6, and 7. Only the confirmed disposable test database is authorized here. Migration 7 is explicit in the SQL test suite; Flask never applies migrations.
+3. Before SQL verification, inspect the target and run read-only consistency/mapping/duplicate-email/founder checks for migrations 5–8. Only the confirmed disposable test database is authorized here. Migrations 7 and 8 run explicitly in the SQL test suite; Flask never applies migrations.
 4. Keep current MVP fixes separate from the future multi-store/RBAC/subscription redesign.
 5. Any real connector work needs signed webhook ingestion, idempotency keys, provider credential encryption, store-level tenant boundaries, retry/dead-letter handling, and reconciliation before it can be called reliable.
 6. Update this file, `README.md`, tests, and `ROADMAP.md` whenever routes, state rules, schema, or verified runtime status changes.
 
-## Phase 2.2 status
+## Phase 2.3 status
 
-Status: global identities and active memberships are implemented and verified on disposable SQL Server. Global users can switch organizations; the mandatory legacy account link and one-seller-per-organization model remain transitional constraints. There is no self-service membership creation, invitation flow, RBAC, multi-store connector, organization lifecycle, subscription, or super-admin control. Membership changes currently require separately authorized trusted SQL administration. Session invalidation on password change, recovery, email ownership verification, abuse controls, production operations, and independent security review remain future work.
+Status: global identities, active memberships, six organization-scoped roles, and Owner-only role assignment are implemented. Global users can switch among authorized memberships; the legacy account link and one-seller-per-organization model remain transitional constraints. There is no self-service membership creation, invitation flow, connector, lifecycle, billing, or super-admin functionality. Durable role-change audits, password-change session invalidation, recovery, email verification, abuse controls, production operations, and independent security review remain priorities.

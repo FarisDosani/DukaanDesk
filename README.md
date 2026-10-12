@@ -2,12 +2,13 @@
 
 DukaanDesk is a server-rendered Flask and Microsoft SQL Server MVP for cash-on-delivery order operations. A seller can onboard one business/organization, expose a domain-scoped order form, review incoming orders, confirm or cancel them, record delivery outcomes, and view twelve-month summaries.
 
-The current code is a single-store-per-seller MVP. The intended product is a multi-tenant B2B SaaS that connects existing Shopify, WooCommerce, and custom storefronts, supports employees and roles, and gives a platform super admin subscription controls. Those capabilities are future work and are not implemented here.
+The current code supports global users, organization memberships, and organization-scoped roles while retaining one store/domain per seller. Shopify/WooCommerce/custom-store connectors, invitations, platform administration, and subscriptions remain future work.
 
 ## Current features
 
 - Seller signup and session-based login.
 - Global user identities and active organization memberships, with a small organization selector for users who have access to multiple organizations.
+- SQL-backed Owner, Admin, Operations, Finance, Marketing, and Support roles. Owner can assign roles to existing active members; there is no membership creation or invitation endpoint.
 - Werkzeug `scrypt` password hashes for new users; a successful legacy plaintext login upgrades that row in place.
 - Lockout after three failed database or demo login attempts.
 - Explicit, opt-in, in-memory demo mode; it is off by default and never silently exposes demo data to database users.
@@ -34,7 +35,9 @@ tests/test_app.py      Automated unit and route tests
 5_Migration.sql        Transactional hardening migration for an existing database
 6_Organizations.sql    Additive organization tenant migration and safe seller backfill
 7_UsersMemberships.sql Global identities, membership constraints, and legacy backfill
+8_OrganizationRoles.sql Membership role assignments, explicit grants, safe founder backfill
 public/_organization_selector.html  Shared selector for multiple active memberships
+public/members.html    Authorized roster and Owner-only role assignments
 checking.sql           User-owned ad-hoc query (not part of setup)
 reset.sql              Manual development unlock helper; review before use
 requirements.txt       Python runtime dependencies
@@ -82,10 +85,11 @@ For a brand-new local database, run these manually in order:
 2. `2_Logic.sql`
 3. `3_DataTesting.sql` (optional development data)
 4. `7_UsersMemberships.sql` in the explicitly selected application database
+5. `8_OrganizationRoles.sql` in the same application database
 
 `1_Schema.sql` refuses to continue if `CODManager` already exists. It no longer drops a database. The fresh schema includes `Organizations`; `2_Logic.sql` installs both the order-log trigger and organization-identity protection.
 
-For an existing pre-Phase-2.1 database, back it up and review the scripts before running `5_Migration.sql`, followed by `6_Organizations.sql`, then `7_UsersMemberships.sql`. For a Phase 2.1 database, only migration 7 is new. Stop application writes while migrating and update all application processes together: older code writes only the legacy authentication table.
+For an existing pre-Phase-2.1 database, review and run migrations 5, 6, 7, then 8. A Phase 2.1 database needs 7 and 8; a Phase 2.2 database needs only 8. Stop application writes during migration and update all processes together. Back up non-disposable deployments before any separately authorized migration.
 
 Migration 7 has no `USE` statement; select the database explicitly. It copies each legacy account into its own global user with the exact password hash, failure count, lock flag, failure timestamp, and creation timestamp. Email uniqueness uses trimmed/lowercase email. Ambiguous duplicate emails (including several legacy accounts under one seller email) abort the transaction for manual ownership resolution; there is no automatic identity merge. Reruns import only unmapped accounts and never overwrite newer authentication state or restore revoked memberships.
 
@@ -237,9 +241,46 @@ $env:SESSION_SECRET = "replace-with-a-long-random-local-secret"
 python -B app.py
 ```
 
-Login keeps the existing email/username/password form. The default organization is the legacy seller organization if active, otherwise another active membership. The selector appears only with multiple active memberships. Revoked/inactive accounts or active sessions whose selected membership is no longer active must sign in again; no self-service membership creation exists. "Active" means a verified database membership, not verified email ownership.
+Login keeps the existing email/username/password form. The default organization is the legacy seller organization if active, otherwise another active membership. The selector offers assigned active memberships and verifies the target permission in SQL. Revoked/inactive accounts or sessions whose selected membership is no longer active must sign in again. "Active" means a verified database membership, not verified email ownership. Unassigned roles deny all protected operations pending manual review.
 
-### Latest verification status — Phase 2.2 (2026-10-12)
+### Phase 2.3 permissions
+
+Assignments belong to each membership, not to the user globally. The six built-in role definitions are shared policy. Every protected request reads the current role and explicit grants from SQL; signed-cookie role/permission claims are not authority. Order and roster queries repeat the permission and tenant checks. Missing roles/grants deny access. UI controls follow the same permissions.
+
+| Role | Dashboard | Summary | Confirm/cancel | Delivery | Switch organization | View members | Assign roles |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Owner | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Admin | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| Operations | Yes | No | Yes | Yes | Yes | No | No |
+| Finance | Yes | Yes | No | No | Yes | No | No |
+| Marketing | Yes | Yes | No | No | Yes | No | No |
+| Support | Yes | No | No | No | Yes | No | No |
+
+Dashboard permission includes the current buyer contact details, amounts, and revenue KPIs; field-level privacy restrictions are not implemented. Finance and Marketing currently share read/report permissions because no marketing workflows exist. Demo retains the existing dashboard, summary, and order actions in memory; it has no SQL membership management.
+
+`GET /organization/members` is limited to Owner/Admin. `POST /organization/members/<user_id>/role` is Owner-only, requires CSRF, targets an existing active membership in the current organization, and cannot demote the last active, unlocked Owner. Concurrent role administration is serialized by an organization lock. It cannot invite, create, or reactivate membership.
+
+Migration 8 adds nullable `OrganizationMemberships.RoleName`, its trusted role foreign key, `Roles`, and `RolePermissions`. Only a sole legacy ClientUser mapped to its own organization is automatically Owner. Additional cross-organization memberships and ambiguous multi-account organizations remain unassigned. Existing membership status and all credential/order data remain unchanged. Founder backfill runs only when the role column is first introduced; reruns preserve assignments and fail on permission-policy drift. Later imports through migration 7 need explicit role review. New-business signup assigns Owner transactionally.
+
+Read-only preflight for the already-confirmed disposable database, followed by migration (already applied locally):
+
+```powershell
+sqlcmd -S "lpc:localhost\MSSQLSERVER01" -E -N -C -d DukaanDesk_Test -b -Q "SELECT DB_NAME() AS TargetDatabase; SELECT COL_LENGTH('dbo.OrganizationMemberships','RoleName') AS ExistingRoleColumn; SELECT COUNT(*) AS AmbiguousFounderOrganizations FROM (SELECT SellerID FROM ClientUsers GROUP BY SellerID HAVING COUNT(*)<>1) D;"
+sqlcmd -S "lpc:localhost\MSSQLSERVER01" -E -N -C -d DukaanDesk_Test -b -i 8_OrganizationRoles.sql
+```
+
+Review ambiguous founders manually; never infer ownership from username, email similarity, or earliest employee ID.
+
+### Latest verification — Phase 2.3 (2026-10-12)
+
+- Full SQL-enabled suite: **33 passed, 72 subtests passed** (23 offline tests and 10 guarded SQL tests). No test failures occurred. `git diff --check` passed.
+- Read-only preflight found 42 sole-account founder mappings, three additional memberships, and zero ambiguous founder organizations. Migration 8 assigned 42 Owners and left the three additional memberships unassigned; membership status and existing accounts/orders were preserved.
+- Tested all six roles against dashboard, summary, decisions, delivery, switching, roster viewing, and role assignment. Also tested role changes without re-login, roleless denial, cross-tenant access, last-owner protection, malformed role requests, immutable existing roles on rerun, and permission-policy drift rejection.
+- First-run migration verification used an uncommitted two-employee organization: neither historical employee became Owner. The new fixture and DDL were rolled back before the actual additive migration; no existing data was deleted or reset.
+- Full original row comparisons preserved pre-existing operational and identity data. Final disposable database: 60 sellers/organizations/legacy accounts/global users, 67 memberships, 73 buyers, 125 orders, 196 logs. Role counts: 58 Owner, 2 Admin, 2 Operations, 5 unassigned. The unassigned rows include preserved additional memberships and later locked-account import fixtures; no automatic role escalation occurred.
+- Only `DukaanDesk_Test` was queried/modified. Its membership-role foreign key is enabled and trusted. Existing unrelated workspace edits were preserved. No deployment or browser visual QA was performed.
+
+### Historical verification — Phase 2.2 (2026-10-12)
 
 - Complete SQL-enabled suite: 28 passed and 10 subtests passed (21 offline tests and 7 SQL tests).
 - Initial read-only preflight: 22 legacy accounts, zero duplicate email groups, zero missing organizations. All 22 accounts were imported with their credential and lockout values preserved.
@@ -268,6 +309,6 @@ Login keeps the existing email/username/password form. The default organization 
 - Account unlock is manual; there is no password reset, email verification, MFA, or administrative recovery workflow.
 - Public order submission has no rate limiting, bot protection, webhook authentication, product catalog, inventory, taxes, shipping calculation, or payment integration.
 - Flask's signed cookie session is used; there is no shared server-side session store.
-- Global users can belong to multiple organizations, but each user retains a required one-to-one legacy account link and each organization still maps to one seller/domain. All active members have the existing seller operational permissions; roles are not implemented. Additional memberships require a separately authorized administrative process. Invitations, connected stores, RBAC, lifecycle, administration, and subscriptions remain future work.
+- Each global user still has a mandatory legacy account link; each organization maps to one seller/domain. Additional memberships and ownerless-organization recovery require a separately authorized administrative process. Role-change audit history, invitations, field-level privacy, connectors, lifecycle, platform administration, and subscriptions remain future work. Last-owner protection applies to the application role endpoint; unrestricted database administrators can bypass it.
 
 See [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) for the detailed technical handoff and [ROADMAP.md](ROADMAP.md) for priorities.

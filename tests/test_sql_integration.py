@@ -30,7 +30,11 @@ class SQLIntegrationTests(unittest.TestCase):
         cls.original_identity_rows = {}
         for table in ("Users", "OrganizationMemberships"):
             if cls.connection.cursor().execute("SELECT OBJECT_ID(?, 'U')", (f"dbo.{table}",)).fetchone()[0]:
-                cls.original_identity_rows[table] = {tuple(row) for row in cls.connection.cursor().execute(f"SELECT * FROM dbo.{table}").fetchall()}
+                columns = 'UserID, OrganizationID, Status, CreatedAt' if table == 'OrganizationMemberships' else '*'
+                cls.original_identity_rows[table] = {tuple(row) for row in cls.connection.cursor().execute(f"SELECT {columns} FROM dbo.{table}").fetchall()}
+        cls.original_roles = set()
+        if cls.connection.cursor().execute("SELECT COL_LENGTH('dbo.OrganizationMemberships','RoleName')").fetchone()[0]:
+            cls.original_roles = {tuple(row) for row in cls.connection.cursor().execute('SELECT UserID,OrganizationID,RoleName FROM OrganizationMemberships').fetchall()}
 
     @classmethod
     def tearDownClass(cls):
@@ -39,9 +43,13 @@ class SQLIntegrationTests(unittest.TestCase):
             if not all(set(rows).issubset(set(current[table])) for table, rows in cls.original_rows.items()):
                 raise AssertionError("Pre-existing legacy rows changed during integration verification")
             for table, rows in cls.original_identity_rows.items():
-                current_rows = {tuple(row) for row in cls.connection.cursor().execute(f"SELECT * FROM dbo.{table}").fetchall()}
+                columns = 'UserID, OrganizationID, Status, CreatedAt' if table == 'OrganizationMemberships' else '*'
+                current_rows = {tuple(row) for row in cls.connection.cursor().execute(f"SELECT {columns} FROM dbo.{table}").fetchall()}
                 if not rows.issubset(current_rows):
                     raise AssertionError("Pre-existing identity rows changed during integration verification")
+            current_roles = {tuple(row) for row in cls.connection.cursor().execute('SELECT UserID,OrganizationID,RoleName FROM OrganizationMemberships').fetchall()}
+            if not cls.original_roles.issubset(current_roles):
+                raise AssertionError('Pre-existing role assignments changed')
         finally:
             cls.connection.close()
 
@@ -102,6 +110,61 @@ class SQLIntegrationTests(unittest.TestCase):
         self.assertEqual(self.query_one("SELECT Status FROM OrganizationMemberships WHERE UserID=? AND OrganizationID=?", (row.UserID, org_id))[0], "Active")
         _, response = self.login(self.identity)
         self.assertIn(b"Account locked", response.data)
+
+    def test_00b_rbac_migration_founders_and_idempotence(self):
+        sql = (Path(__file__).parents[1] / '8_OrganizationRoles.sql').read_text(encoding='utf-8')
+        self.assertEqual(self.query_one('SELECT DB_NAME()')[0], 'DukaanDesk_Test')
+        initial = self.query_one("SELECT COL_LENGTH('dbo.OrganizationMemberships','RoleName')")[0] is None
+        if initial:
+            # Exercise ambiguous founder backfill in a rollback-only transaction, including
+            # the new DDL. No existing tables/data are dropped, reset, or overwritten.
+            cursor = self.connection.cursor()
+            sid = cursor.execute('INSERT Sellers (BusinessName,WhatsAppNumber,Email,DomainName) OUTPUT inserted.SellerID VALUES (?,?,?,?)',
+                ('Ambiguous founder test', self.identity['phone'], self.identity['email'], self.identity['domain'])).fetchone()[0]
+            oid = cursor.execute('INSERT Organizations (LegacySellerID,OrganizationName) OUTPUT inserted.OrganizationID VALUES (?,?)',
+                (sid, 'Ambiguous founder test')).fetchone()[0]
+            for index in range(2):
+                name = f"historical-{self.identity['token']}-{index}"
+                legacy = cursor.execute('INSERT ClientUsers (SellerID,Username,PasswordHash) OUTPUT inserted.UserID VALUES (?,?,?)',
+                    (sid, name, 'synthetic-unusable')).fetchone()[0]
+                uid = cursor.execute('INSERT Users (LegacyClientUserID,Email,Username,PasswordHash) OUTPUT inserted.UserID VALUES (?,?,?,?)',
+                    (legacy, name+'@example.test', name, 'synthetic-unusable')).fetchone()[0]
+                cursor.execute("INSERT OrganizationMemberships (UserID,OrganizationID,Status) VALUES (?,?,'Active')", (uid, oid))
+            try:
+                cursor.execute(sql)
+                count = self.query_one('SELECT COUNT(*) FROM OrganizationMemberships WHERE OrganizationID=? AND RoleName IS NOT NULL', (oid,))[0]
+                self.assertEqual(count, 0, 'Ambiguous historical employees must not become Owner')
+            finally:
+                self.connection.rollback()
+        before = self.snapshot_legacy()
+        self.connection.cursor().execute(sql)
+        self.connection.commit()
+        self.assertTrue(before == self.snapshot_legacy())
+        if initial:
+            wrong = self.query_one("""SELECT COUNT(*) FROM OrganizationMemberships M
+                JOIN Users U ON U.UserID=M.UserID JOIN ClientUsers CU ON CU.UserID=U.LegacyClientUserID
+                JOIN Organizations O ON O.OrganizationID=M.OrganizationID
+                WHERE (M.RoleName='Owner' AND (O.LegacySellerID<>CU.SellerID OR
+                    (SELECT COUNT(*) FROM ClientUsers C WHERE C.SellerID=O.LegacySellerID)<>1))
+                   OR (M.RoleName IS NULL AND O.LegacySellerID=CU.SellerID AND
+                    (SELECT COUNT(*) FROM ClientUsers C WHERE C.SellerID=O.LegacySellerID)=1)""")[0]
+            self.assertEqual(wrong, 0)
+        role_rows = {tuple(row) for row in self.connection.cursor().execute('SELECT * FROM OrganizationMemberships').fetchall()}
+        self.connection.cursor().execute(sql)
+        self.connection.commit()
+        self.assertTrue(role_rows == {tuple(row) for row in self.connection.cursor().execute('SELECT * FROM OrganizationMemberships').fetchall()})
+
+    def test_00c_rbac_policy_drift_fails_closed(self):
+        sql = (Path(__file__).parents[1] / '8_OrganizationRoles.sql').read_text(encoding='utf-8')
+        baseline = {tuple(row) for row in self.connection.cursor().execute('SELECT * FROM RolePermissions').fetchall()}
+        try:
+            self.connection.cursor().execute("INSERT RolePermissions (RoleName,Permission) VALUES ('Support','members.roles')")
+            with self.assertRaises(dukaan.pyodbc.Error) as raised:
+                self.connection.cursor().execute(sql)
+            self.assertIn('50032', str(raised.exception))
+        finally:
+            self.connection.rollback()
+        self.assertTrue(baseline == {tuple(row) for row in self.connection.cursor().execute('SELECT * FROM RolePermissions').fetchall()})
 
     def test_01_ambiguous_email_aborts_without_merging(self):
         before = self.snapshot_legacy()
@@ -473,7 +536,7 @@ class SQLIntegrationTests(unittest.TestCase):
         self.connection.cursor().execute("INSERT OrganizationMemberships (UserID, OrganizationID) VALUES (?, ?)", (global_id, target_org))
         self.connection.commit()
         self.assertEqual(client.post("/organizations/switch", data={"csrf_token": token, "organization_id": target_org}).status_code, 403)
-        self.connection.cursor().execute("UPDATE OrganizationMemberships SET Status='Active' WHERE UserID=? AND OrganizationID=?", (global_id, target_org))
+        self.connection.cursor().execute("UPDATE OrganizationMemberships SET Status='Active', RoleName='Operations' WHERE UserID=? AND OrganizationID=?", (global_id, target_org))
         self.connection.commit()
         self.assertIn(b"organization-select", client.get("/dashboard").data)
         self.assertEqual(client.post("/organizations/switch", data={"csrf_token": token, "organization_id": target_org, "seller_id": 9999}).status_code, 302)
@@ -511,6 +574,91 @@ class SQLIntegrationTests(unittest.TestCase):
         self.assertTrue(client.get("/dashboard").location.endswith("/login"))
         _, denied_login = self.login(self.identity)
         self.assertEqual(denied_login.status_code, 200)
+
+    def test_rbac_all_roles_management_and_immediate_changes(self):
+        owner = self.signup(self.identity)
+        employee = dict(self.identity, email=f"staff-{self.identity['token']}@example.test",
+                        username=f"staff-{self.identity['token']}", domain=f"staff-{self.identity['token']}.test",
+                        phone=f"+97{self.identity['phone'][3:]}", business='RBAC staff home')
+        member = self.signup(employee)
+        with owner.session_transaction() as current:
+            owner_user = dict(current['user'])
+        with member.session_transaction() as current:
+            member_user = dict(current['user'])
+        oid, sid = owner_user['organization_id'], owner_user['seller_id']
+        uid = member_user['global_user_id']
+        self.connection.cursor().execute("INSERT OrganizationMemberships (UserID,OrganizationID,Status,RoleName) VALUES (?,?,'Active','Support')", (uid, oid))
+        self.connection.commit()
+        response = member.post('/organizations/switch', data={'csrf_token':self.csrf(member), 'organization_id':oid})
+        self.assertEqual(response.status_code, 302)
+        policies = {
+            'Owner': (True, True, True), 'Admin': (True, True, True),
+            'Operations': (False, True, False), 'Finance': (True, False, False),
+            'Marketing': (True, False, False), 'Support': (False, False, False),
+        }
+        for role, (summary, writes, roster) in policies.items():
+            with self.subTest(role=role):
+                self.connection.cursor().execute('UPDATE OrganizationMemberships SET RoleName=? WHERE UserID=? AND OrganizationID=?', (role, uid, oid))
+                self.connection.commit()
+                order_ids = []
+                for kind in ('confirm','cancel','delivery'):
+                    buyer = f"RBAC {role} {kind} {self.identity['token']}"
+                    self.place_order(self.identity, buyer, '12.00')
+                    order_ids.append(int(self.query_one('SELECT OrderID FROM Orders WHERE SellerID=? AND BuyerName=?', (sid,buyer))[0]))
+                owner.post(f'/orders/{order_ids[2]}/action', data={'csrf_token':self.csrf(owner), 'action':'confirm'})
+                page = member.get('/dashboard')
+                self.assertEqual(page.status_code, 200)
+                self.assertEqual(b'href="/summary"' in page.data, summary)
+                self.assertEqual(b'href="/organization/members"' in page.data, roster)
+                self.assertEqual(f'action="/orders/{order_ids[0]}/action"'.encode() in page.data, writes)
+                self.assertEqual(member.get('/summary').status_code, 200 if summary else 403)
+                self.assertEqual(member.get('/organization/members').status_code, 200 if roster else 403)
+                for order_id, route, field, value in (
+                    (order_ids[0],'action','action','confirm'),
+                    (order_ids[1],'action','action','not_confirm'),
+                    (order_ids[2],'status','status','delivered'),
+                ):
+                    response = member.post(f'/orders/{order_id}/{route}', data={
+                        'csrf_token':self.csrf(member), field:value, 'role':'Owner', 'organization_id':member_user['organization_id']})
+                    self.assertEqual(response.status_code, 302 if writes else 403)
+                actual = [self.query_one('SELECT OrderStatus,DeliveryStatus FROM Orders WHERE OrderID=?',(order_id,)) for order_id in order_ids]
+                self.assertEqual(actual[0].OrderStatus, 'Confirmed' if writes else 'Pending')
+                self.assertEqual(actual[1].OrderStatus, 'Cancelled' if writes else 'Pending')
+                self.assertEqual(actual[2].DeliveryStatus, 'Delivered' if writes else 'Pending')
+                denied_role = member.post(f'/organization/members/{uid}/role', data={
+                    'csrf_token':self.csrf(member), 'role':role})
+                self.assertEqual(denied_role.status_code, 302 if role=='Owner' else 403)
+                # Switching is available to every defined role, with target membership validation.
+                self.assertEqual(member.post('/organizations/switch', data={'csrf_token':self.csrf(member),
+                    'organization_id':member_user['organization_id']}).status_code, 302)
+                self.assertEqual(member.post('/organizations/switch', data={'csrf_token':self.csrf(member),
+                    'organization_id':oid}).status_code, 302)
+        # Roleless memberships deny even previously authenticated cookies.
+        self.connection.cursor().execute('UPDATE OrganizationMemberships SET RoleName=NULL WHERE UserID=? AND OrganizationID=?', (uid,oid))
+        self.connection.commit()
+        self.assertEqual(member.get('/dashboard').status_code, 403)
+        self.assertEqual(member.post('/organizations/switch', data={'csrf_token':self.csrf(member),
+            'organization_id':member_user['organization_id']}).status_code, 403)
+        # Owner can assign a role without creating/reactivating a membership.
+        self.assertEqual(owner.post(f'/organization/members/{uid}/role', data={
+            'csrf_token':self.csrf(owner), 'role':'Admin'}).status_code, 302)
+        self.assertEqual(member.get('/organization/members').status_code, 200)
+        self.assertEqual(member.post(f'/organization/members/{uid}/role', data={
+            'csrf_token':self.csrf(member), 'role':'Owner'}).status_code, 403)
+        foreign_id = int(self.query_one('SELECT MIN(UserID) FROM Users')[0])
+        self.assertEqual(owner.post(f'/organization/members/{foreign_id}/role', data={
+            'csrf_token':self.csrf(owner), 'role':'Owner', 'organization_id':member_user['organization_id']}).status_code, 404)
+        self.assertEqual(owner.post(f'/organization/members/{uid}/role', data={
+            'csrf_token':self.csrf(owner), 'role':'invented'}).status_code, 400)
+        self.assertEqual(owner.post(f"/organization/members/{owner_user['global_user_id']}/role", data={
+            'csrf_token':self.csrf(owner), 'role':'Support'}).status_code, 409)
+        # Cross-tenant orders remain inaccessible even for Admin.
+        self.place_order(employee, 'Private staff order '+self.identity['token'], '50.00')
+        foreign_order = self.query_one('SELECT MAX(OrderID) FROM Orders WHERE SellerID=?', (member_user['seller_id'],))[0]
+        self.assertNotIn(('Private staff order '+self.identity['token']).encode(), member.get('/dashboard').data)
+        member.post(f'/orders/{foreign_order}/action', data={'csrf_token':self.csrf(member),'action':'confirm'})
+        self.assertEqual(self.query_one('SELECT OrderStatus FROM Orders WHERE OrderID=?',(foreign_order,))[0], 'Pending')
+        self.assertEqual(self.query_one('SELECT COUNT(*) FROM MessageLogs WHERE OrderID=?',(foreign_order,))[0], 1)
 
     def test_organization_backfill_constraints_and_immutable_mapping(self):
         mapping_counts = self.query_one(

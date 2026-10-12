@@ -232,7 +232,7 @@ def get_csrf_token() -> str:
 
 @app.context_processor
 def inject_csrf_token():
-    return {"csrf_token": get_csrf_token, "demo_mode": DEMO_MODE and bool(DEMO_USERS)}
+    return {"csrf_token": get_csrf_token, "demo_mode": DEMO_MODE and bool(DEMO_USERS), "can": has_permission}
 
 
 @app.before_request
@@ -323,12 +323,29 @@ def require_auth(view_fn):
     return wrapped
 
 
+def has_permission(permission: str) -> bool:
+    return permission in getattr(g, "permissions", frozenset())
+
+
+def require_permission(permission: str):
+    def decorate(view_fn):
+        @require_auth
+        @wraps(view_fn)
+        def guarded(*args, **kwargs):
+            if not has_permission(permission):
+                abort(403, description="Your organization role does not permit this action.")
+            return view_fn(*args, **kwargs)
+        return guarded
+    return decorate
+
+
 def resolve_legacy_organization_context() -> bool:
     """Revalidate membership on every request; upgrade old signed sessions safely."""
     user = session.get("user")
     if not user:
         return False
     if user.get("is_demo"):
+        g.permissions = frozenset({"dashboard.view", "summary.view", "orders.decide", "orders.delivery"})
         user["organization_id"] = DEMO_ORGANIZATION_ID
         session["user"] = user
         return True
@@ -340,7 +357,7 @@ def resolve_legacy_organization_context() -> bool:
             """
             SELECT U.UserID AS GlobalUserID, U.LegacyClientUserID AS UserID,
                    U.Email, U.Username, S.SellerID, S.BusinessName, S.DomainName,
-                   Org.OrganizationID
+                   Org.OrganizationID, M.RoleName
             FROM Users U
             JOIN OrganizationMemberships M ON M.UserID = U.UserID AND M.Status = 'Active'
             JOIN Organizations Org ON Org.OrganizationID = M.OrganizationID
@@ -361,7 +378,13 @@ def resolve_legacy_organization_context() -> bool:
             return False
         if user.get("global_user_id") is not None and user["global_user_id"] != selected["global_user_id"]:
             return False
+        # Never cache authority in the signed cookie: roles/grants are read each request.
+        g.permissions = frozenset(row[0] for row in conn.cursor().execute(
+            "SELECT Permission FROM RolePermissions WHERE RoleName = ?",
+            (selected["role_name"],),
+        ).fetchall())
         session["user"] = build_user_session(selected)
+        g.role_name = selected["role_name"]
         return True
     except Exception as err:
         app.logger.error("Organization context resolution failed: %s", err)
@@ -377,6 +400,7 @@ def user_from_membership(row) -> dict:
         "email": row.Email, "username": row.Username,
         "seller_id": int(row.SellerID), "organization_id": str(row.OrganizationID),
         "business_name": row.BusinessName, "domain_name": row.DomainName,
+        "role_name": row.RoleName,
     }
 
 
@@ -407,7 +431,7 @@ def login_with_database(email: str, username: str, password: str) -> dict:
                 U.Email,
                 S.BusinessName,
                 S.DomainName,
-                Org.OrganizationID
+                Org.OrganizationID, M.RoleName
             FROM Users U WITH (UPDLOCK, HOLDLOCK)
             JOIN ClientUsers CU ON CU.UserID = U.LegacyClientUserID
             JOIN OrganizationMemberships M ON M.UserID = U.UserID AND M.Status = 'Active'
@@ -612,8 +636,8 @@ def signup_with_database(payload: dict) -> dict:
         )
         global_user_id = int(cursor.fetchone()[0])
         cursor.execute(
-            """INSERT INTO OrganizationMemberships (UserID, OrganizationID, Status)
-               VALUES (?, ?, 'Active')""", (global_user_id, organization_id),
+            """INSERT INTO OrganizationMemberships (UserID, OrganizationID, Status, RoleName)
+               VALUES (?, ?, 'Active', 'Owner')""", (global_user_id, organization_id),
         )
 
         conn.commit()
@@ -687,6 +711,7 @@ def fetch_orders_for_dashboard(
     apply_search: bool = True,
     allow_demo: bool = False,
     global_user_id: int | None = None,
+    required_permission: str = "dashboard.view",
 ):
     if allow_demo and DEMO_MODE and DEMO_USERS:
         if organization_id != DEMO_ORGANIZATION_ID:
@@ -732,9 +757,11 @@ def fetch_orders_for_dashboard(
             WHERE O.SellerID = ? AND Org.OrganizationID = ?
               AND M.UserID = ? AND M.Status = 'Active' AND U.IsActive = 1
               AND U.IsLocked = 0 AND U.FailedAttempts < 3
+              AND EXISTS (SELECT 1 FROM RolePermissions RP
+                          WHERE RP.RoleName = M.RoleName AND RP.Permission = ?)
             ORDER BY O.OrderDate DESC
             """,
-            (seller_id, organization_id, global_user_id),
+            (seller_id, organization_id, global_user_id, required_permission),
         )
         columns = [desc[0] for desc in cursor.description]
         rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -1202,7 +1229,7 @@ def logout():
 
 
 @app.get("/dashboard")
-@require_auth
+@require_permission("dashboard.view")
 def dashboard():
     user = session["user"]
     search = str(request.args.get("search", "")).strip()
@@ -1228,7 +1255,7 @@ def dashboard():
 
 
 @app.get("/summary")
-@require_auth
+@require_permission("summary.view")
 def summary_page():
     user = session["user"]
     all_orders, source = fetch_orders_for_dashboard(
@@ -1237,6 +1264,7 @@ def summary_page():
         apply_search=False,
         allow_demo=user.get("is_demo", False),
         global_user_id=user.get("global_user_id"),
+        required_permission="summary.view",
     )
     active_orders = [order for order in all_orders if is_active_dashboard_order(order)]
     summary_sections = build_summary_sections(all_orders)
@@ -1252,7 +1280,7 @@ def summary_page():
 
 
 @app.post("/organizations/switch")
-@require_auth
+@require_permission("organizations.switch")
 def switch_organization():
     if session["user"].get("is_demo"):
         abort(403)
@@ -1266,6 +1294,21 @@ def switch_organization():
                      if item["organization_id"].lower() == requested), None)
     if selected is None:
         abort(403)
+    # A roleless target is not a usable selection; query target permission again.
+    conn = get_db_connection()
+    try:
+        allowed = conn.cursor().execute(
+            """SELECT 1 FROM OrganizationMemberships M JOIN RolePermissions RP ON RP.RoleName=M.RoleName
+               JOIN Users U ON U.UserID=M.UserID
+               WHERE M.UserID=? AND M.OrganizationID=? AND M.Status='Active'
+                 AND U.IsActive=1 AND U.IsLocked=0 AND U.FailedAttempts<3
+                 AND RP.Permission='organizations.switch'""",
+            (selected["global_user_id"], requested),
+        ).fetchone()
+        if not allowed:
+            abort(403)
+    finally:
+        conn.close()
     session.clear()
     session["user"] = build_user_session(selected)
     session.permanent = True
@@ -1273,8 +1316,85 @@ def switch_organization():
     return redirect(url_for("dashboard"))
 
 
+@app.get("/organization/members")
+@require_permission("members.view")
+def organization_members():
+    user = session["user"]
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        rows = cursor.execute(
+            """SELECT U.UserID, U.Username, M.Status, M.RoleName
+               FROM OrganizationMemberships M JOIN Users U ON U.UserID=M.UserID
+               WHERE M.OrganizationID=? AND EXISTS (
+                   SELECT 1 FROM OrganizationMemberships A JOIN Users Actor ON Actor.UserID=A.UserID
+                   JOIN RolePermissions RP ON RP.RoleName=A.RoleName
+                   WHERE A.OrganizationID=M.OrganizationID AND A.UserID=? AND A.Status='Active'
+                     AND Actor.IsActive=1 AND Actor.IsLocked=0 AND Actor.FailedAttempts<3
+                     AND RP.Permission='members.view') ORDER BY U.Username""",
+            (user["organization_id"], user["global_user_id"]),
+        ).fetchall()
+        roles = [row[0] for row in cursor.execute("SELECT RoleName FROM Roles ORDER BY RoleName").fetchall()]
+        return render_template("members.html", user=user, members=rows, roles=roles)
+    finally:
+        conn.close()
+
+
+@app.post("/organization/members/<int:member_id>/role")
+@require_permission("members.roles")
+def change_member_role(member_id: int):
+    user = session["user"]
+    role = request.form.get("role", "")
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        # Serialize role administration per organization, including last-owner checks.
+        cursor.execute("SELECT OrganizationID FROM Organizations WITH (UPDLOCK,HOLDLOCK) WHERE OrganizationID=?",
+                       (user["organization_id"],)).fetchone()
+        actor = cursor.execute(
+            """SELECT M.UserID FROM OrganizationMemberships M WITH (UPDLOCK,HOLDLOCK)
+               JOIN Users U WITH (UPDLOCK,HOLDLOCK) ON U.UserID=M.UserID
+               JOIN RolePermissions RP WITH (HOLDLOCK) ON RP.RoleName=M.RoleName
+               WHERE M.OrganizationID=? AND M.UserID=? AND M.Status='Active'
+                 AND U.IsActive=1 AND U.IsLocked=0 AND U.FailedAttempts<3
+                 AND RP.Permission='members.roles'""",
+            (user["organization_id"], user["global_user_id"]),
+        ).fetchone()
+        if not actor:
+            abort(403)
+        if not cursor.execute("SELECT 1 FROM Roles WHERE RoleName=?", (role,)).fetchone():
+            abort(400, description="Unknown role.")
+        target = cursor.execute(
+            """SELECT RoleName FROM OrganizationMemberships WITH (UPDLOCK,HOLDLOCK)
+               WHERE OrganizationID=? AND UserID=? AND Status='Active'""",
+            (user["organization_id"], member_id),
+        ).fetchone()
+        if not target:
+            abort(404)
+        if target.RoleName == "Owner" and role != "Owner":
+            other_owners = cursor.execute(
+                """SELECT COUNT(*) FROM OrganizationMemberships M WITH (UPDLOCK,HOLDLOCK)
+                   JOIN Users U WITH (UPDLOCK,HOLDLOCK) ON U.UserID=M.UserID
+                   WHERE M.OrganizationID=? AND M.UserID<>? AND M.Status='Active'
+                     AND M.RoleName='Owner' AND U.IsActive=1 AND U.IsLocked=0 AND U.FailedAttempts<3""",
+                (user["organization_id"], member_id),
+            ).fetchone()[0]
+            if not other_owners:
+                abort(409, description="Keep at least one active, unlocked Owner.")
+        cursor.execute("UPDATE OrganizationMemberships SET RoleName=? WHERE OrganizationID=? AND UserID=? AND Status='Active'",
+                       (role, user["organization_id"], member_id))
+        conn.commit()
+    except pyodbc.Error:
+        conn.rollback()
+        app.logger.error("Role change failed due to a database error.")
+        abort(503)
+    finally:
+        conn.close()
+    return redirect(url_for("organization_members"))
+
+
 @app.post("/orders/<int:order_id>/action")
-@require_auth
+@require_permission("orders.decide")
 def update_order_action(order_id: int):
     action = str(request.form.get("action", "")).strip().lower()
     if action not in {"confirm", "not_confirm"}:
@@ -1311,6 +1431,8 @@ def update_order_action(order_id: int):
                     AND Org.OrganizationID = ?
                     AND M.UserID = ? AND M.Status = 'Active' AND U.IsActive = 1
                     AND U.IsLocked = 0 AND U.FailedAttempts < 3
+                    AND EXISTS (SELECT 1 FROM RolePermissions RP WHERE RP.RoleName=M.RoleName
+                                AND RP.Permission='orders.decide')
               )
               AND OrderStatus = 'Pending'
               AND DeliveryStatus IS NULL
@@ -1352,7 +1474,7 @@ def update_order_action(order_id: int):
 
 
 @app.post("/orders/<int:order_id>/status")
-@require_auth
+@require_permission("orders.delivery")
 def update_order_status(order_id: int):
     status = str(request.form.get("status", "")).strip().lower()
     status_map = {"delivered": "Delivered", "returned_by_buyer": "Returned by buyer"}
@@ -1390,6 +1512,8 @@ def update_order_status(order_id: int):
                     AND Org.OrganizationID = ?
                     AND M.UserID = ? AND M.Status = 'Active' AND U.IsActive = 1
                     AND U.IsLocked = 0 AND U.FailedAttempts < 3
+                    AND EXISTS (SELECT 1 FROM RolePermissions RP WHERE RP.RoleName=M.RoleName
+                                AND RP.Permission='orders.delivery')
               )
               AND OrderStatus = 'Confirmed'
               AND DeliveryStatus = 'Pending'
