@@ -6,7 +6,7 @@ Last updated: 2026-10-12
 
 DukaanDesk should evolve from the current single-domain COD operations MVP into a multi-tenant B2B SaaS for businesses that already sell through Shopify, WooCommerce, or custom websites. A business should eventually connect multiple stores, assign employees role-based access, consolidate orders and analytics, and manage a subscription. A platform super admin should manage tenant onboarding, plans, service health, and support operations.
 
-Phase 2.1 now provides the first additive tenant foundation: immutable organization IDs mapped one-to-one to legacy sellers. Multi-store, membership/RBAC, super-admin, and subscription capabilities remain deliberately unimplemented.
+Phase 2.1 added immutable organization IDs mapped one-to-one to legacy sellers. Phase 2.2 adds global users, active organization memberships, and authorized switching. Multi-store, invitations/RBAC, super-admin, and subscription capabilities remain unimplemented.
 
 ## Completed in the current MVP hardening pass
 
@@ -32,16 +32,20 @@ Phase 2.1 now provides the first additive tenant foundation: immutable organizat
 - Added `Organizations` as immutable tenant identities with a unique legacy `SellerID` mapping.
 - Added an idempotent transactional migration that safely backfills every existing seller.
 - Resolved tenant context from authenticated database mappings and enforced organization plus seller scope on protected order reads/writes.
+- Added global Users with unique normalized email/username, preserved legacy credential/lockout copies, and active/inactive/revoked organization memberships.
+- Added migration 7 with transactional backfill, duplicate-email ambiguity rejection, idempotence, and no membership reactivation on rerun.
+- Revalidate memberships and user activity/lockout on every protected request and in protected order SQL; provide a minimal CSRF-protected organization selector.
 
-The original hardening and Phase 2.1 organization work have now been verified against the disposable SQL Server database described below. This still does not establish production readiness.
+The original hardening and Phase 2.1/2.2 work have been verified against the disposable SQL Server database described below. This does not establish production readiness.
 
 ## Verification checkpoint — 2026-10-12
 
-- Offline verification is green: 18 tests pass, three guarded SQL tests skip by default, and five invalid-amount subtests pass. Compilation passes.
-- SQL verification is green: the full suite reports 21 passed against the confirmed disposable `DukaanDesk_Test` database on `localhost\MSSQLSERVER01`.
+- Offline verification: 21 tests pass with 10 subtests; seven guarded SQL tests require explicit opt-in.
+- SQL verification: the full suite reports 28 passed and 10 subtests against confirmed disposable `DukaanDesk_Test` on `localhost\MSSQLSERVER01`.
 - Signup, password hashing, hashed login, legacy-plaintext upgrade, lockout, order creation, confirmation/cancellation, delivery, tenant isolation, exact message logs, summaries, and concurrent seller-relative numbering were exercised against real SQL Server.
 - Read-only migration preflight found no invalid or cross-seller rows. The organization migration backfilled all 18 existing sellers without changing legacy row fingerprints, and a second run inserted zero rows. Seed and reset scripts were not run; `CODManager` remained absent.
 - **Phase 2.1 organization foundation is complete.** The additive migration preserved the original synthetic dataset, backfilled every seller, and passed idempotence, immutability, mapping, and cross-organization tests.
+- **Phase 2.2 global users/memberships are complete within scope.** Migration imported all 22 initial accounts without ambiguous emails; full original row comparisons passed. SQL tests verify exact locked-account backfill, ambiguity rollback, switching, legacy-session upgrade, inactive/revoked access denial, and rerun preservation. No membership provisioning, invitations, or roles were added.
 
 ## P0 — required before any real launch
 
@@ -96,7 +100,9 @@ Continue this as a versioned migration and service-boundary project. Keep `Selle
    - Define tenant-aware unique keys, query guards, audit records, exports, and deletion policy.
 
 2. **Users, memberships, and RBAC**
-   - Separate global user identity from organization membership.
+   - Completed in Phase 2.2: global Users and OrganizationMemberships, active membership checks, server-authorized organization switching, and legacy login compatibility.
+   - Next: design trusted membership administration and permission boundaries before exposing employee onboarding; currently every active member has existing seller operational permissions.
+   - Remove the mandatory legacy account dependency only through a separately designed migration; do not merge accounts automatically by email.
    - Owner-managed invitations with expiry and revocation.
    - Roles/permissions such as owner, admin, order operator, support, analyst, and read-only.
    - Store-scoped assignments where needed; deny by default and test every permission boundary.

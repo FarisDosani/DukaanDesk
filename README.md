@@ -7,12 +7,13 @@ The current code is a single-store-per-seller MVP. The intended product is a mul
 ## Current features
 
 - Seller signup and session-based login.
+- Global user identities and active organization memberships, with a small organization selector for users who have access to multiple organizations.
 - Werkzeug `scrypt` password hashes for new users; a successful legacy plaintext login upgrades that row in place.
 - Lockout after three failed database or demo login attempts.
 - Explicit, opt-in, in-memory demo mode; it is off by default and never silently exposes demo data to database users.
 - Public order entry at `/store/<seller-domain>`.
 - Immutable organization tenant IDs with a one-to-one mapping to legacy sellers.
-- Organization- and seller-scoped dashboard queries and mutations; tenant IDs are resolved server-side and are never accepted from forms.
+- Organization- and seller-scoped dashboard queries and mutations. Switching accepts an organization selection but authorizes it against active memberships in SQL; protected requests revalidate access every time.
 - Seller-scoped buyers and order numbers, preserving the existing database model.
 - Pending order confirmation/cancellation and one-way delivery outcomes.
 - Delivered-revenue KPIs, search, and twelve-month delivered/cancelled/returned summaries.
@@ -32,6 +33,8 @@ tests/test_app.py      Automated unit and route tests
 4_Reports.sql          Read-only reporting queries
 5_Migration.sql        Transactional hardening migration for an existing database
 6_Organizations.sql    Additive organization tenant migration and safe seller backfill
+7_UsersMemberships.sql Global identities, membership constraints, and legacy backfill
+public/_organization_selector.html  Shared selector for multiple active memberships
 checking.sql           User-owned ad-hoc query (not part of setup)
 reset.sql              Manual development unlock helper; review before use
 requirements.txt       Python runtime dependencies
@@ -78,12 +81,15 @@ For a brand-new local database, run these manually in order:
 1. `1_Schema.sql`
 2. `2_Logic.sql`
 3. `3_DataTesting.sql` (optional development data)
+4. `7_UsersMemberships.sql` in the explicitly selected application database
 
 `1_Schema.sql` refuses to continue if `CODManager` already exists. It no longer drops a database. The fresh schema includes `Organizations`; `2_Logic.sql` installs both the order-log trigger and organization-identity protection.
 
-For an existing pre-Phase-2.1 database, back it up and review the scripts before running `5_Migration.sql`, followed by `6_Organizations.sql`. Both migrations are additive/transactional. `6_Organizations.sql` creates exactly one organization for every unmapped seller, refuses an incompatible pre-existing table, and can be re-run safely. The updated application requires this migration because login and tenant-scoped order access join `Organizations`.
+For an existing pre-Phase-2.1 database, back it up and review the scripts before running `5_Migration.sql`, followed by `6_Organizations.sql`, then `7_UsersMemberships.sql`. For a Phase 2.1 database, only migration 7 is new. Stop application writes while migrating and update all application processes together: older code writes only the legacy authentication table.
 
-No database script is run automatically by the Flask application. `reset.sql` changes account lock state and is only a manual development helper.
+Migration 7 has no `USE` statement; select the database explicitly. It copies each legacy account into its own global user with the exact password hash, failure count, lock flag, failure timestamp, and creation timestamp. Email uniqueness uses trimmed/lowercase email. Ambiguous duplicate emails (including several legacy accounts under one seller email) abort the transaction for manual ownership resolution; there is no automatic identity merge. Reruns import only unmapped accounts and never overwrite newer authentication state or restore revoked memberships.
+
+No database script is run automatically by Flask. `Users` is now the authentication authority; the app mirrors authentication changes to `ClientUsers` in the same transaction. Legacy-only SQL helpers such as `reset.sql` must not be used to administer current credentials or unlock accounts.
 
 The optional seed credentials are:
 
@@ -170,7 +176,7 @@ python -m pip check
 
 ### Disposable SQL Server integration test
 
-The integration suite has a hard safety gate: it skips unless `RUN_SQL_INTEGRATION_TESTS=1` and `DB_NAME` is exactly `DukaanDesk_Test`; it also verifies `DB_NAME()` before writing. It creates uniquely named synthetic rows and does not delete existing rows.
+The integration suite has a hard safety gate: it skips unless `RUN_SQL_INTEGRATION_TESTS=1` and `DB_NAME` is exactly `DukaanDesk_Test`; it also verifies `DB_NAME()` before writing. It applies/reruns migration 7, creates uniquely named synthetic rows, and verifies full pre-existing row values in memory without printing credentials. Duplicate-email rollback fixtures can leave identity-number gaps. No cleanup deletes run. Membership provisioning/revocation in these tests is trusted fixture SQL, not a public app feature.
 
 PowerShell configuration for the verified local instance:
 
@@ -211,7 +217,38 @@ $migrationText | sqlcmd -S "lpc:localhost\MSSQLSERVER01" -E -N -C -b
 
 Do not use this substitution for any database whose disposable ownership is uncertain.
 
-### Latest verification status (2026-10-12)
+### Phase 2.2 migration and local runtime
+
+For the confirmed disposable Phase 2.1 database, run a read-only preflight before migration. The duplicate-email and missing-mapping counts must be zero; stop for manual review otherwise:
+
+```powershell
+sqlcmd -S "lpc:localhost\MSSQLSERVER01" -E -N -C -d DukaanDesk_Test -b -Q "SELECT DB_NAME() AS TargetDatabase; SELECT COUNT(*) AS AmbiguousEmailGroups FROM (SELECT LOWER(LTRIM(RTRIM(S.Email))) AS EmailKey FROM ClientUsers CU JOIN Sellers S ON S.SellerID=CU.SellerID GROUP BY LOWER(LTRIM(RTRIM(S.Email))) HAVING COUNT(*)>1) D; SELECT COUNT(*) AS MissingMappings FROM ClientUsers CU LEFT JOIN Organizations O ON O.LegacySellerID=CU.SellerID WHERE O.OrganizationID IS NULL;"
+sqlcmd -S "lpc:localhost\MSSQLSERVER01" -E -N -C -d DukaanDesk_Test -b -i 7_UsersMemberships.sql
+```
+
+The current `DukaanDesk_Test` is already migrated. Run the app with Windows authentication:
+
+```powershell
+$env:DB_SERVER = "localhost\MSSQLSERVER01"
+$env:DB_NAME = "DukaanDesk_Test"
+$env:DB_ENCRYPT = "true"
+$env:DB_TRUST_SERVER_CERTIFICATE = "true"
+$env:SESSION_SECRET = "replace-with-a-long-random-local-secret"
+python -B app.py
+```
+
+Login keeps the existing email/username/password form. The default organization is the legacy seller organization if active, otherwise another active membership. The selector appears only with multiple active memberships. Revoked/inactive accounts or active sessions whose selected membership is no longer active must sign in again; no self-service membership creation exists. "Active" means a verified database membership, not verified email ownership.
+
+### Latest verification status — Phase 2.2 (2026-10-12)
+
+- Complete SQL-enabled suite: 28 passed and 10 subtests passed (21 offline tests and 7 SQL tests).
+- Initial read-only preflight: 22 legacy accounts, zero duplicate email groups, zero missing organizations. All 22 accounts were imported with their credential and lockout values preserved.
+- SQL tests verify migration idempotence, duplicate-email rollback, locked legacy account backfill, legacy session upgrade, active switching, rejected inactive/revoked memberships, disabled-user rejection, and the existing authentication/order/reporting workflows.
+- Full original rows in all six legacy tables, plus pre-existing global users/memberships on subsequent runs, were compared in memory and preserved. No system database or `CODManager` operations were performed in Phase 2.2.
+- Final disposable counts: 35 sellers/organizations/legacy accounts/global users, 37 memberships (35 active, 2 revoked), 48 buyers, 60 orders, 89 logs. Zero missing user mappings, ambiguous emails, or disabled/untrusted identity foreign keys.
+- Browser visual QA and production deployment remain unverified.
+
+### Historical Phase 2.1 verification (2026-10-12)
 
 - Offline suite: 18 passed, 3 SQL tests safely skipped, and 5 invalid-amount subtests passed.
 - SQL-enabled complete suite: 21 passed, including 3 real SQL integration tests and 5 invalid-amount subtests.
@@ -231,6 +268,6 @@ Do not use this substitution for any database whose disposable ownership is unce
 - Account unlock is manual; there is no password reset, email verification, MFA, or administrative recovery workflow.
 - Public order submission has no rate limiting, bot protection, webhook authentication, product catalog, inventory, taxes, shipping calculation, or payment integration.
 - Flask's signed cookie session is used; there is no shared server-side session store.
-- Organization identity now exists, but authenticated membership still uses the legacy `ClientUsers.SellerID` link and every organization still maps one-to-one to one seller/business/domain. Connected stores, invitations, RBAC, lifecycle/soft deletion, platform administration, and subscriptions are roadmap items.
+- Global users can belong to multiple organizations, but each user retains a required one-to-one legacy account link and each organization still maps to one seller/domain. All active members have the existing seller operational permissions; roles are not implemented. Additional memberships require a separately authorized administrative process. Invitations, connected stores, RBAC, lifecycle, administration, and subscriptions remain future work.
 
 See [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) for the detailed technical handoff and [ROADMAP.md](ROADMAP.md) for priorities.

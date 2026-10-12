@@ -17,6 +17,7 @@
                 <h2 id="welcomeTitle">{{ user.business_name }} | Orders Dashboard</h2>
                 <p id="identityLine">Signed in as {{ user.username }}{% if user.domain_name %} | Domain: {{ user.domain_name }}{% endif %}</p>
             </div>
+            {% include '_organization_selector.html' %}
             <form method="post" action="/logout">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                 <button id="logoutBtn" class="btn-secondary" type="submit">Logout</button>

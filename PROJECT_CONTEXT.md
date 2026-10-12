@@ -6,7 +6,7 @@ This document is the implementation handoff for future developers and AI assista
 
 ## Product boundary
 
-Current MVP: one immutable `Organizations` tenant mapped one-to-one to each legacy seller, one unique domain per signup, one or more historical `ClientUsers` rows per seller at the database level, domain-scoped public COD order intake, seller order decisions, delivery outcomes, and reporting.
+Current MVP: immutable `Organizations` tenants mapped one-to-one to legacy sellers, global `Users` with active organization memberships, one unique domain per signup, domain-scoped public COD order intake, seller order decisions, delivery outcomes, and reporting. A user can switch among existing active memberships; there is no membership provisioning UI or API.
 
 Long-term vision: a multi-tenant B2B SaaS where each business can connect multiple existing Shopify, WooCommerce, or custom stores; invite employees with role-based permissions; operate orders and analytics across those stores; and be managed by a platform super admin with subscription/billing controls. None of the connector, multi-store, RBAC, super-admin, or subscription architecture exists yet. Do not describe it as implemented.
 
@@ -28,11 +28,14 @@ app.py (single Flask process)
           ▼
 Microsoft SQL Server / CODManager
   ├─ Organizations ── Sellers ── ClientUsers
+  ├─ Users ── OrganizationMemberships ── Organizations
+  ├─ Users ── one-to-one legacy ClientUsers mapping
   ├─ Sellers ── Buyers ── Orders
   ├─ Orders ── MessageLogs
   ├─ vw_PendingConfirmations
   ├─ trg_AutoLogCreation
-  └─ trg_Organizations_ImmutableIdentity
+  ├─ trg_Organizations_ImmutableIdentity
+  └─ trg_Users_ImmutableIdentity
 ```
 
 There is no JSON API, SPA, background worker, queue, cache, external identity provider, product service, connector service, or messaging provider. Pages are server-rendered. The JavaScript footprint is effectively absent; shared presentation is in `public/styles.css`.
@@ -48,21 +51,25 @@ There is no JSON API, SPA, background worker, queue, cache, external identity pr
 - `public/index.html`: legacy navigation page; `/` currently redirects to login/dashboard instead of rendering it.
 - `public/styles.css`: responsive shared styles; imports Google Fonts over the network.
 - `tests/test_app.py`: database-free unit/route tests using fake pyodbc connections.
+- `tests/test_sql_integration.py`: guarded real-SQL migration, identity, membership, and MVP tests; captures pre-existing row values without logging secrets.
+- `public/_organization_selector.html`: shared CSRF-protected selector, displayed only for multiple active memberships.
 - `1_Schema.sql`: fresh `CODManager` installer. It aborts when the database already exists.
 - `2_Logic.sql`: creates/updates the pending view and a multi-row-safe insert trigger.
 - `3_DataTesting.sql`: idempotent local seed; it does not delete existing rows.
 - `4_Reports.sql`: delivered-revenue and message audit queries.
 - `5_Migration.sql`: additive, transactional hardening for an existing database. It aborts on inconsistent rows.
 - `6_Organizations.sql`: additive, idempotent organization migration. It backfills one tenant per seller and installs immutable-identity protection.
-- `reset.sql`: manual development query that unlocks user 1. It is not part of setup.
+- `7_UsersMemberships.sql`: additive transactional global identity/membership migration; must run in an explicitly selected application database after Phase 2.1 (also required after a fresh schema).
+- `reset.sql`: legacy-only unlock helper; no longer suitable for current authentication, whose authority is `Users`.
 - `checking.sql`: pre-existing user-owned ad-hoc seller query. It is not part of setup.
 - `package.json` / `package-lock.json`: legacy Node dependencies are unused. `npm start` and `npm test` now delegate to Python for convenience.
 
 ## Flask routes
 
 - `GET /`: redirects authenticated sessions to `/dashboard`, otherwise `/login`.
-- `GET|POST /login`: authenticates by seller email plus globally unique username and password, then resolves `OrganizationID` by joining the authenticated user's legacy seller mapping. Successful login rotates the session and establishes an eight-hour permanent session.
-- `GET|POST /signup`: validates and creates a `Sellers` row, its one-to-one `Organizations` row, and the first `ClientUsers` row in one transaction. Existing domains and WhatsApp numbers are rejected; unauthenticated creation of extra users for a seller is intentionally disallowed.
+- `GET|POST /login`: retains email/username/password login, authenticates against `Users`, and chooses an active membership (preferring the legacy seller organization). Successful login rotates the session and establishes an eight-hour permanent session.
+- `GET|POST /signup`: atomically creates seller, organization, legacy account, global user, and initial active membership. Existing domains/WhatsApp numbers and duplicate global emails/usernames are rejected. It cannot attach a user to an existing organization.
+- `POST /organizations/switch`: validates a UUID selection against the requesting user's freshly queried active memberships, then rotates session and CSRF state. Unauthorized selections receive 403; malformed IDs receive 400. No membership is created.
 - `POST /logout`: clears the session.
 - `GET /dashboard`: requires authentication; loads only orders matching both the signed server-derived organization context and its legacy seller ID, then displays operational orders whose state is pending confirmation or confirmed/awaiting delivery.
 - `GET /summary`: requires authentication; loads all organization-and-seller-scoped orders and groups terminal outcomes over the latest twelve calendar months.
@@ -73,7 +80,7 @@ There is no JSON API, SPA, background worker, queue, cache, external identity pr
 - `GET /login.html`, `/signup.html`, `/dashboard.html`, `/summary.html`, `/store.html`: compatibility redirects.
 - `/static/<path>`: Flask static handler for files under `public/`.
 
-All POST routes require the per-session hidden `csrf_token`. State-changing seller queries contain `OrderID`, `SellerID`, the corresponding `OrganizationID` mapping, and the expected current state in the `WHERE` clause. Form/query tenant IDs are ignored.
+All POST routes require the per-session hidden `csrf_token`. Protected requests verify an active, unlocked global user and active selected membership in SQL every time. State-changing order queries additionally contain `OrderID`, `SellerID`, `OrganizationID`, active global user/membership checks, and expected current state. The switch form's organization ID is only a selection; order forms cannot override tenant context.
 
 ## Database model
 
@@ -87,9 +94,17 @@ Immutable SaaS tenant identity: GUID `OrganizationID`, unique `LegacySellerID`, 
 
 ### ClientUsers
 
-Portal identity linked to `SellerID`: globally unique `Username`, `PasswordHash`, failed-attempt count, lock flag, last-failure timestamp, and creation timestamp. New values are Werkzeug `scrypt` hashes. When a legacy plaintext value matches during login, it is replaced with a hash inside the successful-login update.
+Legacy account linked to `SellerID`: globally unique `Username`, `PasswordHash`, failed-attempt count, lock flag, last-failure timestamp, and creation timestamp. Rows and keys remain intact for compatibility. Authentication now reads `Users`; app login updates mirror credential and lockout fields back into this table in the same transaction. Legacy-only updates no longer change the authoritative credential.
 
 The current UI creates only the first user for a new seller. A secure invitation and RBAC workflow is intentionally deferred.
+
+### Users and OrganizationMemberships
+
+`Users.UserID` is the global integer identity. `LegacyClientUserID` is a required unique foreign key to `ClientUsers.UserID`; a trigger rejects identity/remapping updates. Unique `Username` and computed persisted `NormalizedEmail` (trim/lowercase) prevent duplicate global identities. PasswordHash, FailedAttempts, IsLocked, LastFailedAt, and CreatedAt are copied exactly at migration. `IsActive` can disable the global account. Authentication uses Werkzeug hashes with the existing successful-login legacy plaintext upgrade and three-attempt lockout; a locked SQL read serializes login failure updates.
+
+`OrganizationMemberships` has composite primary key `(UserID, OrganizationID)`, two non-cascading foreign keys, CreatedAt, and a constrained Status (`Active`, `Inactive`, `Revoked`). The default is Inactive; migration and new-business signup explicitly create Active membership. There are no roles: an active member currently receives the existing seller order/reporting capabilities. Active membership is verified from the database; email verification is still absent.
+
+Migration 7 runs without a `USE` directive and refuses system databases. Preflight aborts on ambiguous normalized legacy seller emails, missing organizations, invalid failure counts, partial identity schema, or missing/untrusted expected constraints. One global user is created per unmapped legacy account, with its legacy organization membership. It never merges by email. Multiple legacy users sharing a business email require manual identity/ownership resolution before migration; this deployment had zero such groups. Reruns preserve existing user state and memberships, including revoked or removed memberships; no automatic reactivation occurs. Stop old application processes during migration because older versions write only ClientUsers.
 
 ### Buyers
 
@@ -125,16 +140,16 @@ Weak child entity keyed by `(LogID, OrderID)`. The trigger logs initial order cr
 
 1. Normalize email/domain and validate field lengths/formats plus a 10-character minimum password.
 2. Reject an existing domain or WhatsApp number. Database unique constraints also guard races and email/username duplication.
-3. Insert seller, organization mapping, and scrypt-hashed portal user in one transaction.
+3. Insert seller, organization, scrypt-hashed legacy account, global user, and active initial membership in one transaction.
 4. Rotate into an authenticated seller session.
 
 ### Login
 
-1. Find `ClientUsers` joined to `Sellers` and `Organizations` using username and seller email.
+1. Find an active global user by username and normalized email, joined to active memberships and their organization/seller records. Prefer the legacy organization; otherwise use the first active organization ordered by seller ID.
 2. Reject locked accounts; increment and persist failures up to the three-attempt lock.
 3. Verify a recognized Werkzeug hash, or constant-time compare a legacy plaintext value.
-4. Upgrade a successfully matched legacy value to scrypt and clear failures.
-5. Clear/rotate the Flask session, record the server-resolved seller and organization identities, and issue a new CSRF token. Pre-Phase-2.1 signed sessions missing the organization value are upgraded by querying `ClientUsers.UserID`; a seller mismatch invalidates the session.
+4. Upgrade a successfully matched legacy value to scrypt and clear failures. Mirror exact credential/lockout values to ClientUsers in the same transaction.
+5. Rotate the signed session and CSRF token. Session `id` remains the legacy account ID; `global_user_id` is distinct. Every protected request resolves memberships by legacy ID and rejects mismatched global identity, seller/organization, inactive membership, inactive user, or lockout. Old signed sessions can obtain the missing global/organization ID only through their valid database mapping. Database failures fail closed. Switching uses fresh membership rows and derives all seller/display fields server-side.
 
 If the database operation raises and explicit demo mode is configured, only matching configured demo credentials can open a demo session. Invalid database credentials do not fall through to demo mode. Demo data is returned only when the authenticated session has `is_demo=true`.
 
@@ -148,7 +163,7 @@ If the database operation raises and explicit demo mode is configured, only matc
 
 ### Dashboard/reporting
 
-The dashboard query joins `Orders`, `Sellers`, `Organizations`, and `Buyers` and always filters by both seller and organization ID. Search is performed in Python over the tenant-scoped result. Delivered revenue includes only `DeliveryStatus='Delivered'`. The summary uses order creation month—not delivery completion month, because no completion timestamp exists.
+The dashboard query joins orders/buyers to organization, active membership, and active/unlocked global user records, filtering by seller, organization, and global user IDs. These guards are repeated in order mutation SQL to reject access revoked after the initial request check. Public domain-based ordering remains intentionally unauthenticated. Search is performed in Python over the tenant-scoped result. Delivered revenue includes only delivered orders; summaries still use order creation month.
 
 ## Security decisions implemented
 
@@ -177,11 +192,11 @@ Important environment variables are documented in `README.md`. `SESSION_SECRET` 
 Verified offline on 2026-10-12:
 
 - `python -m py_compile app.py tests/test_app.py tests/test_sql_integration.py`.
-- `python -m pytest -q -p no:cacheprovider`: 18 passed, 3 guarded SQL tests skipped, and 5 invalid-amount subtests passed.
+- Phase 2.2 offline tests: 21 tests pass with 10 subtests. The seven SQL tests require explicit opt-in.
 - Public GET pages render; protected pages redirect; missing CSRF receives HTTP 400; security headers are present.
 - `python -m pip check` reported no broken requirements, and `git diff --check` passed.
 
-Verified with SQL Server on 2026-10-12:
+Historical Phase 1.5/2.1 SQL verification on 2026-10-12:
 
 - SQL Server 17.0 Standard Developer Edition at `localhost\MSSQLSERVER01`, using Windows Authentication, ODBC Driver 18, `DB_ENCRYPT=true`, and `DB_TRUST_SERVER_CERTIFICATE=true`.
 - A read-only master query confirmed zero non-system databases and that `DukaanDesk_Test` was absent. The guarded schema was adapted in memory to create only `DukaanDesk_Test`; `CODManager` remained absent.
@@ -190,6 +205,14 @@ Verified with SQL Server on 2026-10-12:
 - The SQL-enabled suite passed 21 tests total: 18 offline tests plus three guarded real-database tests. New coverage verified signup mapping creation, login context, complete one-to-one backfill, trusted constraints, blocked identity remapping, mismatched organization read/write denial, and ignored client tenant input, alongside all prior MVP workflow coverage.
 - Read-only migration preflight on populated synthetic data found zero invalid order states, zero cross-seller orders, and zero legacy credential values. The non-destructive `5_Migration.sql` completed successfully after in-memory database-name substitution; the tenant foreign key and all four order checks remained enabled and trusted.
 - Final database audit found 22 sellers/organizations/users, 34 buyers, 42 orders, and 63 logs after the new integration run. Every original row fingerprint remained intact; all new rows were uniquely named synthetic test records. There were zero missing/duplicate organization mappings and zero cross-seller orders. No cleanup deletes ran.
+
+Phase 2.2 SQL verification on 2026-10-12:
+
+- Read-only preflight confirmed only the selected `DukaanDesk_Test` target: 22 legacy accounts and organizations, 34 buyers, 42 orders, 63 logs; Users and OrganizationMemberships were absent. Duplicate email and missing organization counts were zero.
+- Migration imported all 22 legacy identities. Tests compared entire legacy rows (including hashes/lockout values) in memory before and after migration without exposing credential values. A rerun preserved exact user/membership rows. No system database or CODManager query/write ran in this phase.
+- The final full suite passed 28 tests plus 10 subtests: 21 offline and seven SQL tests. Covered duplicate-email transactional abort, exact locked-account backfill, legacy login/session compatibility, switching, forged context rejection, inactive/revoked access, no reactivation on migration rerun, and all prior order/reporting/concurrency workflows.
+- Every row present before each test run in legacy tables and existing global identity tables was preserved by full-row subset checks. New synthetic fixtures remain, including inactive users and revoked memberships; aborted inserts may leave identity-number gaps.
+- Final counts: 35 sellers/organizations/legacy accounts/global users, 37 memberships (35 active and 2 revoked), 48 buyers, 60 orders, and 89 logs. Zero missing user mappings, ambiguous email groups, or disabled/untrusted identity foreign keys.
 
 Not verified in the current environment:
 
@@ -201,11 +224,11 @@ Not verified in the current environment:
 
 1. Preserve uncommitted user changes. At audit time, branding edits in all HTML pages, `checking.sql`, and a tracked `.pyc` modification predated the security work.
 2. Do not run `reset.sql`, delete rows, drop databases, or execute a migration without the user's confirmation and a backup.
-3. Before SQL verification, inspect the target and run read-only consistency queries corresponding to the preflight checks in `5_Migration.sql` and the mapping checks in `6_Organizations.sql`.
+3. Before SQL verification, inspect the target and run read-only consistency/mapping/duplicate-email checks for migrations 5, 6, and 7. Only the confirmed disposable test database is authorized here. Migration 7 is explicit in the SQL test suite; Flask never applies migrations.
 4. Keep current MVP fixes separate from the future multi-store/RBAC/subscription redesign.
 5. Any real connector work needs signed webhook ingestion, idempotency keys, provider credential encryption, store-level tenant boundaries, retry/dead-letter handling, and reconciliation before it can be called reliable.
 6. Update this file, `README.md`, tests, and `ROADMAP.md` whenever routes, state rules, schema, or verified runtime status changes.
 
-## Phase 2.1 status
+## Phase 2.2 status
 
-Status: **organization/tenant foundation implemented and verified on the disposable SQL Server database**. Organization identity and seller mapping are additive, existing legacy relationships remain intact, and authenticated operations require both boundaries. This does not implement global identities/memberships, invitations, RBAC, multi-store connectors, organization lifecycle, subscriptions, or super-admin controls. It is not production-launch readiness: the remaining P0 identity, abuse prevention, runtime/operations, and independent security-review work still applies.
+Status: global identities and active memberships are implemented and verified on disposable SQL Server. Global users can switch organizations; the mandatory legacy account link and one-seller-per-organization model remain transitional constraints. There is no self-service membership creation, invitation flow, RBAC, multi-store connector, organization lifecycle, subscription, or super-admin control. Membership changes currently require separately authorized trusted SQL administration. Session invalidation on password change, recovery, email ownership verification, abuse controls, production operations, and independent security review remain future work.

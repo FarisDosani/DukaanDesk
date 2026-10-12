@@ -1,6 +1,7 @@
 import os
 import unittest
 import uuid
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import app as dukaan
@@ -25,10 +26,97 @@ class SQLIntegrationTests(unittest.TestCase):
         if database_name != "DukaanDesk_Test":
             cls.connection.close()
             raise RuntimeError("Refusing to test outside DukaanDesk_Test")
+        cls.original_rows = cls.snapshot_legacy()
+        cls.original_identity_rows = {}
+        for table in ("Users", "OrganizationMemberships"):
+            if cls.connection.cursor().execute("SELECT OBJECT_ID(?, 'U')", (f"dbo.{table}",)).fetchone()[0]:
+                cls.original_identity_rows[table] = {tuple(row) for row in cls.connection.cursor().execute(f"SELECT * FROM dbo.{table}").fetchall()}
 
     @classmethod
     def tearDownClass(cls):
-        cls.connection.close()
+        try:
+            current = cls.snapshot_legacy()
+            if not all(set(rows).issubset(set(current[table])) for table, rows in cls.original_rows.items()):
+                raise AssertionError("Pre-existing legacy rows changed during integration verification")
+            for table, rows in cls.original_identity_rows.items():
+                current_rows = {tuple(row) for row in cls.connection.cursor().execute(f"SELECT * FROM dbo.{table}").fetchall()}
+                if not rows.issubset(current_rows):
+                    raise AssertionError("Pre-existing identity rows changed during integration verification")
+        finally:
+            cls.connection.close()
+
+    @classmethod
+    def snapshot_legacy(cls):
+        # Full values stay in memory; never print credential material on assertion failure.
+        return {table: [tuple(row) for row in cls.connection.cursor().execute(f"SELECT * FROM dbo.{table}").fetchall()]
+                for table in ("Sellers", "ClientUsers", "Organizations", "Buyers", "Orders", "MessageLogs")}
+
+    def apply_identity_migration(self):
+        self.assertEqual(self.query_one("SELECT DB_NAME()")[0], "DukaanDesk_Test")
+        sql = (Path(__file__).parents[1] / "7_UsersMemberships.sql").read_text(encoding="utf-8")
+        self.connection.cursor().execute(sql)
+        self.connection.commit()
+
+    def test_00_identity_migration_preserves_data_and_is_idempotent(self):
+        before = self.snapshot_legacy()
+        mapped_ids = set()
+        if self.query_one("SELECT OBJECT_ID('dbo.Users','U')")[0] is not None:
+            mapped_ids = {row[0] for row in self.connection.cursor().execute("SELECT LegacyClientUserID FROM Users").fetchall()}
+        self.apply_identity_migration()
+        self.assertTrue(before == self.snapshot_legacy(), "Migration changed legacy data")
+        missing = self.query_one("""SELECT COUNT(*) FROM ClientUsers CU
+            LEFT JOIN Users U ON U.LegacyClientUserID = CU.UserID WHERE U.UserID IS NULL""")[0]
+        self.assertEqual(missing, 0)
+        # Initial copy is byte-for-byte for credential and lockout fields.
+        copies = self.connection.cursor().execute("""SELECT CU.UserID, CU.PasswordHash, CU.FailedAttempts,
+            CU.IsLocked, CU.LastFailedAt, CU.CreatedAt, U.PasswordHash, U.FailedAttempts,
+            U.IsLocked, U.LastFailedAt, U.CreatedAt
+            FROM ClientUsers CU JOIN Users U ON U.LegacyClientUserID = CU.UserID""").fetchall()
+        self.assertTrue(all(tuple(row[1:6]) == tuple(row[6:11]) for row in copies if row[0] not in mapped_ids),
+                        "Newly imported credential/lockout fields differ")
+        users_before = [tuple(row) for row in self.connection.cursor().execute("SELECT * FROM Users ORDER BY UserID").fetchall()]
+        members_before = [tuple(row) for row in self.connection.cursor().execute("SELECT * FROM OrganizationMemberships ORDER BY UserID, OrganizationID").fetchall()]
+        self.apply_identity_migration()
+        self.assertTrue(users_before == [tuple(row) for row in self.connection.cursor().execute("SELECT * FROM Users ORDER BY UserID").fetchall()])
+        self.assertTrue(members_before == [tuple(row) for row in self.connection.cursor().execute("SELECT * FROM OrganizationMemberships ORDER BY UserID, OrganizationID").fetchall()])
+
+    def test_02_backfill_locked_legacy_account(self):
+        cursor = self.connection.cursor()
+        seller_id = int(cursor.execute("""INSERT Sellers (BusinessName, WhatsAppNumber, Email, DomainName)
+            OUTPUT inserted.SellerID VALUES (?, ?, ?, ?)""",
+            (self.identity["business"], self.identity["phone"], self.identity["email"], self.identity["domain"])).fetchone()[0])
+        org_id = str(cursor.execute("INSERT Organizations (LegacySellerID,OrganizationName) OUTPUT inserted.OrganizationID VALUES (?,?)",
+                                    (seller_id, self.identity["business"])).fetchone()[0])
+        password_hash = dukaan.generate_password_hash(self.identity["password"])
+        legacy_id = int(cursor.execute("""INSERT ClientUsers
+            (SellerID,Username,PasswordHash,FailedAttempts,IsLocked,LastFailedAt)
+            OUTPUT inserted.UserID VALUES (?,?,?,3,1,'2026-01-01')""",
+            (seller_id, self.identity["username"], password_hash)).fetchone()[0])
+        self.connection.commit()
+        self.apply_identity_migration()
+        row = self.query_one("SELECT UserID,PasswordHash,FailedAttempts,IsLocked,LastFailedAt FROM Users WHERE LegacyClientUserID=?", (legacy_id,))
+        self.assertTrue(row.PasswordHash == password_hash)
+        self.assertEqual(int(row.FailedAttempts), 3)
+        self.assertTrue(row.IsLocked)
+        self.assertEqual(row.LastFailedAt.year, 2026)
+        self.assertEqual(self.query_one("SELECT Status FROM OrganizationMemberships WHERE UserID=? AND OrganizationID=?", (row.UserID, org_id))[0], "Active")
+        _, response = self.login(self.identity)
+        self.assertIn(b"Account locked", response.data)
+
+    def test_01_ambiguous_email_aborts_without_merging(self):
+        before = self.snapshot_legacy()
+        user_count = self.query_one("SELECT COUNT(*) FROM Users")[0]
+        # Uncommitted duplicate legacy account; migration must roll back the entire transaction.
+        self.connection.cursor().execute("""INSERT ClientUsers (SellerID, Username, PasswordHash)
+            SELECT MIN(SellerID), ?, 'test-only-unusable-value' FROM Sellers""", ("ambiguous-" + self.identity["token"],))
+        try:
+            with self.assertRaises(dukaan.pyodbc.Error) as raised:
+                self.apply_identity_migration()
+            self.assertIn("50022", str(raised.exception))
+        finally:
+            self.connection.rollback()
+        self.assertTrue(before == self.snapshot_legacy())
+        self.assertEqual(user_count, self.query_one("SELECT COUNT(*) FROM Users")[0])
 
     def setUp(self):
         token = uuid.uuid4().hex[:12]
@@ -164,6 +252,10 @@ class SQLIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(int(lock_row.FailedAttempts), 3)
         self.assertTrue(bool(lock_row.IsLocked))
+        mirrored = self.query_one("""SELECT COUNT(*) FROM Users U JOIN ClientUsers CU ON CU.UserID=U.LegacyClientUserID
+            WHERE U.Username=? AND U.FailedAttempts=CU.FailedAttempts AND U.IsLocked=CU.IsLocked
+              AND U.LastFailedAt=CU.LastFailedAt""", (locked_identity["username"],))[0]
+        self.assertEqual(mirrored, 1)
 
         legacy_identity = dict(self.identity)
         legacy_identity.update(
@@ -178,6 +270,10 @@ class SQLIntegrationTests(unittest.TestCase):
         self.signup(legacy_identity)
         self.connection.cursor().execute(
             "UPDATE ClientUsers SET PasswordHash = ? WHERE Username = ?",
+            (legacy_identity["password"], legacy_identity["username"]),
+        )
+        self.connection.cursor().execute(
+            "UPDATE Users SET PasswordHash = ? WHERE Username = ?",
             (legacy_identity["password"], legacy_identity["username"]),
         )
         self.connection.commit()
@@ -318,7 +414,8 @@ class SQLIntegrationTests(unittest.TestCase):
             session_user["organization_id"] = locked_organization_id
             current_session["user"] = session_user
         mismatched_dashboard = owner_client.get("/dashboard")
-        self.assertEqual(mismatched_dashboard.status_code, 200)
+        self.assertEqual(mismatched_dashboard.status_code, 302)
+        self.assertTrue(mismatched_dashboard.location.endswith("/login"))
         self.assertNotIn(organization_guard_buyer.encode(), mismatched_dashboard.data)
         mismatched_update = owner_client.post(
             f"/orders/{organization_guard_order_id}/action",
@@ -335,10 +432,8 @@ class SQLIntegrationTests(unittest.TestCase):
             (organization_guard_order_id,),
         )[0]
         self.assertEqual(guarded_status, "Pending")
-        with owner_client.session_transaction() as current_session:
-            session_user = dict(current_session["user"])
-            session_user["organization_id"] = organization_id
-            current_session["user"] = session_user
+        owner_client, login_response = self.login(self.identity)
+        self.assertEqual(login_response.status_code, 302)
 
         dashboard_response = owner_client.get("/dashboard")
         self.assertEqual(dashboard_response.status_code, 200)
@@ -357,6 +452,65 @@ class SQLIntegrationTests(unittest.TestCase):
             """
         )
         self.assertEqual(constraint_row[0], 1)
+
+    def test_membership_switching_and_revocation(self):
+        client = self.signup(self.identity)
+        second = dict(self.identity, email=f"second-{self.identity['token']}@example.test",
+                      username=f"second-{self.identity['token']}", domain=f"second-{self.identity['token']}.test",
+                      phone=f"+96{self.identity['phone'][3:]}", business="Second Membership Test Shop")
+        self.signup(second)
+        with client.session_transaction() as current_session:
+            original_user = dict(current_session["user"])
+        global_id = original_user["global_user_id"]
+        target = self.query_one("""SELECT O.OrganizationID, S.SellerID FROM Organizations O
+            JOIN Sellers S ON S.SellerID=O.LegacySellerID WHERE S.DomainName=?""", (second["domain"],))
+        target_org, target_seller = str(target[0]), int(target[1])
+        self.place_order(second, "Membership Buyer " + self.identity["token"], "45.00")
+        order_id = int(self.query_one("SELECT MAX(OrderID) FROM Orders WHERE SellerID=?", (target_seller,))[0])
+        token = self.csrf(client)
+        self.assertEqual(client.post("/organizations/switch", data={"csrf_token": token, "organization_id": target_org}).status_code, 403)
+        # Only test fixture SQL provisions membership; there is no membership-creation route.
+        self.connection.cursor().execute("INSERT OrganizationMemberships (UserID, OrganizationID) VALUES (?, ?)", (global_id, target_org))
+        self.connection.commit()
+        self.assertEqual(client.post("/organizations/switch", data={"csrf_token": token, "organization_id": target_org}).status_code, 403)
+        self.connection.cursor().execute("UPDATE OrganizationMemberships SET Status='Active' WHERE UserID=? AND OrganizationID=?", (global_id, target_org))
+        self.connection.commit()
+        self.assertIn(b"organization-select", client.get("/dashboard").data)
+        self.assertEqual(client.post("/organizations/switch", data={"csrf_token": token, "organization_id": target_org, "seller_id": 9999}).status_code, 302)
+        with client.session_transaction() as current_session:
+            switched = dict(current_session["user"])
+            self.assertEqual(switched["seller_id"], target_seller)
+            self.assertEqual(switched["global_user_id"], global_id)
+            self.assertNotEqual(current_session["csrf_token"], token)
+        self.assertIn(("Membership Buyer " + self.identity["token"]).encode(), client.get("/dashboard").data)
+        token = self.csrf(client)
+        client.post(f"/orders/{order_id}/action", data={"csrf_token": token, "action": "confirm"})
+        self.assertEqual(self.query_one("SELECT OrderStatus FROM Orders WHERE OrderID=?", (order_id,))[0], "Confirmed")
+        self.connection.cursor().execute("UPDATE OrganizationMemberships SET Status='Revoked' WHERE UserID=? AND OrganizationID=?", (global_id, target_org))
+        self.connection.commit()
+        self.apply_identity_migration()
+        self.assertEqual(self.query_one("SELECT Status FROM OrganizationMemberships WHERE UserID=? AND OrganizationID=?", (global_id, target_org))[0], "Revoked")
+        denied = client.post(f"/orders/{order_id}/status", data={"csrf_token": token, "status": "delivered"})
+        self.assertTrue(denied.location.endswith("/login"))
+        self.assertEqual(self.query_one("SELECT DeliveryStatus FROM Orders WHERE OrderID=?", (order_id,))[0], "Pending")
+        rows, source = dukaan.fetch_orders_for_dashboard(target_seller, target_org, global_user_id=global_id)
+        self.assertEqual((rows, source), ([], "database"))
+        # Inactive global identities invalidate otherwise valid signed sessions and login.
+        client, response = self.login(self.identity)
+        self.assertEqual(response.status_code, 302)
+        # A legacy signed session upgrades to a global identity via its actual membership.
+        with client.session_transaction() as current_session:
+            old_user = dict(current_session["user"])
+            old_user.pop("global_user_id")
+            current_session["user"] = old_user
+        self.assertEqual(client.get("/dashboard").status_code, 200)
+        with client.session_transaction() as current_session:
+            self.assertEqual(current_session["user"]["global_user_id"], global_id)
+        self.connection.cursor().execute("UPDATE Users SET IsActive=0 WHERE UserID=?", (global_id,))
+        self.connection.commit()
+        self.assertTrue(client.get("/dashboard").location.endswith("/login"))
+        _, denied_login = self.login(self.identity)
+        self.assertEqual(denied_login.status_code, 200)
 
     def test_organization_backfill_constraints_and_immutable_mapping(self):
         mapping_counts = self.query_one(

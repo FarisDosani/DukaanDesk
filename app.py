@@ -6,9 +6,10 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from functools import wraps
+from uuid import UUID
 
 import pyodbc
-from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
+from flask import Flask, abort, flash, g, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -195,6 +196,7 @@ def is_account_locked(attempts: int) -> bool:
 def build_user_session(user: dict) -> dict:
     return {
         "id": user["id"],
+        "global_user_id": user.get("global_user_id"),
         "email": user.get("email"),
         "username": user["username"],
         "seller_id": user["seller_id"],
@@ -265,6 +267,8 @@ def is_missing_auth_table(err: Exception) -> bool:
     text = db_error_text(err)
     return (
         "invalid object name 'clientusers'" in text
+        or "invalid object name 'users'" in text
+        or "invalid object name 'organizationmemberships'" in text
         or "invalid object name 'organizations'" in text
     )
 
@@ -273,6 +277,8 @@ def is_missing_signup_table(err: Exception) -> bool:
     text = db_error_text(err)
     return (
         "invalid object name 'clientusers'" in text
+        or "invalid object name 'users'" in text
+        or "invalid object name 'organizationmemberships'" in text
         or "invalid object name 'sellers'" in text
         or "invalid object name 'organizations'" in text
         or "invalid object name 'buyers'" in text
@@ -308,18 +314,17 @@ def require_auth(view_fn):
         if session["user"].get("is_demo") and not (DEMO_MODE and DEMO_USERS):
             session.clear()
             return redirect(url_for("login"))
-        if not session["user"].get("organization_id"):
-            if not resolve_legacy_organization_context():
-                session.clear()
-                flash("Your organization could not be resolved. Please sign in again.", "error")
-                return redirect(url_for("login"))
+        if not resolve_legacy_organization_context():
+            session.clear()
+            flash("Your account or organization access has changed. Please sign in again.", "error")
+            return redirect(url_for("login"))
         return view_fn(*args, **kwargs)
 
     return wrapped
 
 
 def resolve_legacy_organization_context() -> bool:
-    """Upgrade a pre-Phase-2.1 session from its authenticated ClientUsers mapping."""
+    """Revalidate membership on every request; upgrade old signed sessions safely."""
     user = session.get("user")
     if not user:
         return False
@@ -331,22 +336,32 @@ def resolve_legacy_organization_context() -> bool:
     conn = None
     try:
         conn = get_db_connection()
-        row = conn.cursor().execute(
+        rows = conn.cursor().execute(
             """
-            SELECT TOP 1
-                CU.UserID,
-                CU.SellerID,
-                Org.OrganizationID
-            FROM ClientUsers CU
-            INNER JOIN Organizations Org ON Org.LegacySellerID = CU.SellerID
-            WHERE CU.UserID = ?
+            SELECT U.UserID AS GlobalUserID, U.LegacyClientUserID AS UserID,
+                   U.Email, U.Username, S.SellerID, S.BusinessName, S.DomainName,
+                   Org.OrganizationID
+            FROM Users U
+            JOIN OrganizationMemberships M ON M.UserID = U.UserID AND M.Status = 'Active'
+            JOIN Organizations Org ON Org.OrganizationID = M.OrganizationID
+            JOIN Sellers S ON S.SellerID = Org.LegacySellerID
+            WHERE U.LegacyClientUserID = ? AND U.IsActive = 1
+              AND U.IsLocked = 0 AND U.FailedAttempts < 3
+            ORDER BY S.SellerID
             """,
             (user.get("id"),),
-        ).fetchone()
-        if not row or int(row.SellerID) != int(user.get("seller_id", -1)):
+        ).fetchall()
+        memberships = [user_from_membership(row) for row in rows]
+        g.organization_memberships = memberships
+        expected_org = user.get("organization_id")
+        selected = next((item for item in memberships
+                         if item["seller_id"] == user.get("seller_id")
+                         and (not expected_org or item["organization_id"].lower() == str(expected_org).lower())), None)
+        if not selected:
             return False
-        user["organization_id"] = str(row.OrganizationID)
-        session["user"] = user
+        if user.get("global_user_id") is not None and user["global_user_id"] != selected["global_user_id"]:
+            return False
+        session["user"] = build_user_session(selected)
         return True
     except Exception as err:
         app.logger.error("Organization context resolution failed: %s", err)
@@ -356,6 +371,25 @@ def resolve_legacy_organization_context() -> bool:
             conn.close()
 
 
+def user_from_membership(row) -> dict:
+    return {
+        "id": int(row.UserID), "global_user_id": int(row.GlobalUserID),
+        "email": row.Email, "username": row.Username,
+        "seller_id": int(row.SellerID), "organization_id": str(row.OrganizationID),
+        "business_name": row.BusinessName, "domain_name": row.DomainName,
+    }
+
+
+def mirror_legacy_auth(cursor, global_user_id: int):
+    """Keep legacy readers compatible; Users is the authentication authority."""
+    cursor.execute(
+        """UPDATE CU SET PasswordHash = U.PasswordHash, FailedAttempts = U.FailedAttempts,
+               IsLocked = U.IsLocked, LastFailedAt = U.LastFailedAt
+           FROM ClientUsers CU JOIN Users U ON U.LegacyClientUserID = CU.UserID
+           WHERE U.UserID = ?""", (global_user_id,),
+    )
+
+
 def login_with_database(email: str, username: str, password: str) -> dict:
     conn = get_db_connection()
     try:
@@ -363,20 +397,24 @@ def login_with_database(email: str, username: str, password: str) -> dict:
         cursor.execute(
             """
             SELECT TOP 1
-                CU.UserID,
-                CU.Username,
-                CU.PasswordHash,
-                CU.FailedAttempts,
-                CU.IsLocked,
+                U.LegacyClientUserID AS UserID,
+                U.UserID AS GlobalUserID,
+                U.Username,
+                U.PasswordHash,
+                U.FailedAttempts,
+                U.IsLocked,
                 S.SellerID,
-                S.Email,
+                U.Email,
                 S.BusinessName,
                 S.DomainName,
                 Org.OrganizationID
-            FROM ClientUsers CU
-            INNER JOIN Sellers S ON S.SellerID = CU.SellerID
-            INNER JOIN Organizations Org ON Org.LegacySellerID = S.SellerID
-            WHERE CU.Username = ? AND S.Email = ?
+            FROM Users U WITH (UPDLOCK, HOLDLOCK)
+            JOIN ClientUsers CU ON CU.UserID = U.LegacyClientUserID
+            JOIN OrganizationMemberships M ON M.UserID = U.UserID AND M.Status = 'Active'
+            JOIN Organizations Org ON Org.OrganizationID = M.OrganizationID
+            JOIN Sellers S ON S.SellerID = Org.LegacySellerID
+            WHERE U.Username = ? AND U.NormalizedEmail = ? AND U.IsActive = 1
+            ORDER BY CASE WHEN S.SellerID = CU.SellerID THEN 0 ELSE 1 END, S.SellerID
             """,
             (username, email),
         )
@@ -398,15 +436,11 @@ def login_with_database(email: str, username: str, password: str) -> dict:
             updated_attempts = failed_attempts + 1
             should_lock = 1 if updated_attempts >= 3 else 0
             cursor.execute(
-                """
-                UPDATE ClientUsers
-                SET FailedAttempts = ?,
-                    IsLocked = ?,
-                    LastFailedAt = GETDATE()
-                WHERE UserID = ?
-                """,
-                (updated_attempts, should_lock, row.UserID),
+                """UPDATE Users SET FailedAttempts = ?, IsLocked = ?, LastFailedAt = GETDATE()
+                   WHERE UserID = ?""",
+                (updated_attempts, should_lock, row.GlobalUserID),
             )
+            mirror_legacy_auth(cursor, row.GlobalUserID)
             conn.commit()
 
             if should_lock:
@@ -424,42 +458,27 @@ def login_with_database(email: str, username: str, password: str) -> dict:
             }
 
         if needs_upgrade:
+            upgraded_hash = generate_password_hash(password)
             cursor.execute(
-                """
-                UPDATE ClientUsers
-                SET PasswordHash = ?,
-                    FailedAttempts = 0,
-                    IsLocked = 0,
-                    LastFailedAt = NULL
-                WHERE UserID = ?
-                """,
-                (generate_password_hash(password), row.UserID),
+                """UPDATE Users SET PasswordHash = ?, FailedAttempts = 0,
+                   IsLocked = 0, LastFailedAt = NULL WHERE UserID = ?""",
+                (upgraded_hash, row.GlobalUserID),
             )
         else:
             cursor.execute(
-                """
-                UPDATE ClientUsers
-                SET FailedAttempts = 0,
-                    IsLocked = 0,
-                    LastFailedAt = NULL
-                WHERE UserID = ?
-                """,
-                (row.UserID,),
+                """UPDATE Users SET FailedAttempts = 0, IsLocked = 0,
+                   LastFailedAt = NULL WHERE UserID = ?""", (row.GlobalUserID,),
             )
+        mirror_legacy_auth(cursor, row.GlobalUserID)
         conn.commit()
 
         return {
             "ok": True,
-            "user": {
-                "id": int(row.UserID),
-                "email": row.Email,
-                "username": row.Username,
-                "seller_id": int(row.SellerID),
-                "organization_id": str(row.OrganizationID),
-                "business_name": row.BusinessName,
-                "domain_name": row.DomainName,
-            },
+            "user": user_from_membership(row),
         }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -585,10 +604,23 @@ def signup_with_database(payload: dict) -> dict:
             raise RuntimeError("Unable to create user account.")
         user_id = int(inserted_user[0])
 
+        cursor.execute(
+            """INSERT INTO Users (LegacyClientUserID, Email, Username, PasswordHash)
+               OUTPUT INSERTED.UserID
+               SELECT UserID, ?, Username, PasswordHash FROM ClientUsers WHERE UserID = ?""",
+            (email, user_id),
+        )
+        global_user_id = int(cursor.fetchone()[0])
+        cursor.execute(
+            """INSERT INTO OrganizationMemberships (UserID, OrganizationID, Status)
+               VALUES (?, ?, 'Active')""", (global_user_id, organization_id),
+        )
+
         conn.commit()
 
         return {
             "id": user_id,
+            "global_user_id": global_user_id,
             "email": email,
             "username": payload["username"],
             "seller_id": seller_id,
@@ -654,6 +686,7 @@ def fetch_orders_for_dashboard(
     search: str = "",
     apply_search: bool = True,
     allow_demo: bool = False,
+    global_user_id: int | None = None,
 ):
     if allow_demo and DEMO_MODE and DEMO_USERS:
         if organization_id != DEMO_ORGANIZATION_ID:
@@ -663,7 +696,7 @@ def fetch_orders_for_dashboard(
             rows = filter_dashboard_orders(rows, search)
         return rows, "demo"
 
-    if not organization_id:
+    if not organization_id or global_user_id is None:
         return [], "organization unavailable"
 
     conn = None
@@ -693,11 +726,15 @@ def fetch_orders_for_dashboard(
             FROM Orders O
             INNER JOIN Sellers S ON O.SellerID = S.SellerID
             INNER JOIN Organizations Org ON Org.LegacySellerID = O.SellerID
+            INNER JOIN OrganizationMemberships M ON M.OrganizationID = Org.OrganizationID
+            INNER JOIN Users U ON U.UserID = M.UserID
             INNER JOIN Buyers B ON O.BuyerID = B.BuyerID AND B.SellerID = O.SellerID
             WHERE O.SellerID = ? AND Org.OrganizationID = ?
+              AND M.UserID = ? AND M.Status = 'Active' AND U.IsActive = 1
+              AND U.IsLocked = 0 AND U.FailedAttempts < 3
             ORDER BY O.OrderDate DESC
             """,
-            (seller_id, organization_id),
+            (seller_id, organization_id, global_user_id),
         )
         columns = [desc[0] for desc in cursor.description]
         rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -1174,6 +1211,7 @@ def dashboard():
         user["organization_id"],
         apply_search=False,
         allow_demo=user.get("is_demo", False),
+        global_user_id=user.get("global_user_id"),
     )
     active_orders = [order for order in all_orders if is_active_dashboard_order(order)]
     active_orders = filter_dashboard_orders(active_orders, search)
@@ -1198,6 +1236,7 @@ def summary_page():
         user["organization_id"],
         apply_search=False,
         allow_demo=user.get("is_demo", False),
+        global_user_id=user.get("global_user_id"),
     )
     active_orders = [order for order in all_orders if is_active_dashboard_order(order)]
     summary_sections = build_summary_sections(all_orders)
@@ -1210,6 +1249,28 @@ def summary_page():
         kpis=kpis,
         source=source,
     )
+
+
+@app.post("/organizations/switch")
+@require_auth
+def switch_organization():
+    if session["user"].get("is_demo"):
+        abort(403)
+    try:
+        requested = str(UUID(request.form.get("organization_id", "")))
+    except (ValueError, TypeError, AttributeError):
+        abort(400, description="Invalid organization selection.")
+    # The supplied ID is only a selection; authority comes from the fresh DB lookup
+    # performed by require_auth, never from the form or cached session memberships.
+    selected = next((item for item in g.organization_memberships
+                     if item["organization_id"].lower() == requested), None)
+    if selected is None:
+        abort(403)
+    session.clear()
+    session["user"] = build_user_session(selected)
+    session.permanent = True
+    get_csrf_token()
+    return redirect(url_for("dashboard"))
 
 
 @app.post("/orders/<int:order_id>/action")
@@ -1244,8 +1305,12 @@ def update_order_action(order_id: int):
               AND EXISTS (
                   SELECT 1
                   FROM Organizations Org
+                  JOIN OrganizationMemberships M ON M.OrganizationID = Org.OrganizationID
+                  JOIN Users U ON U.UserID = M.UserID
                   WHERE Org.LegacySellerID = Orders.SellerID
                     AND Org.OrganizationID = ?
+                    AND M.UserID = ? AND M.Status = 'Active' AND U.IsActive = 1
+                    AND U.IsLocked = 0 AND U.FailedAttempts < 3
               )
               AND OrderStatus = 'Pending'
               AND DeliveryStatus IS NULL
@@ -1256,6 +1321,7 @@ def update_order_action(order_id: int):
                 order_id,
                 session["user"]["seller_id"],
                 session["user"]["organization_id"],
+                session["user"]["global_user_id"],
             ),
         )
         rows_affected = cursor.rowcount
@@ -1318,8 +1384,12 @@ def update_order_status(order_id: int):
               AND EXISTS (
                   SELECT 1
                   FROM Organizations Org
+                  JOIN OrganizationMemberships M ON M.OrganizationID = Org.OrganizationID
+                  JOIN Users U ON U.UserID = M.UserID
                   WHERE Org.LegacySellerID = Orders.SellerID
                     AND Org.OrganizationID = ?
+                    AND M.UserID = ? AND M.Status = 'Active' AND U.IsActive = 1
+                    AND U.IsLocked = 0 AND U.FailedAttempts < 3
               )
               AND OrderStatus = 'Confirmed'
               AND DeliveryStatus = 'Pending'
@@ -1329,6 +1399,7 @@ def update_order_status(order_id: int):
                 order_id,
                 session["user"]["seller_id"],
                 session["user"]["organization_id"],
+                session["user"]["global_user_id"],
             ),
         )
         rows_affected = cursor.rowcount
