@@ -48,6 +48,8 @@ class InvitationTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 dukaan.send_invitation_email('test@example.test','subject','body')
         smtp = MagicMock()
+        smtp.__enter__.return_value.ehlo.return_value = (250, b'ready')
+        smtp.__enter__.return_value.send_message.return_value = {}
         with patch.dict(os.environ, {'SMTP_HOST':'smtp.example.test','SMTP_FROM':'sender@example.test'}, clear=True), \
              patch.object(dukaan.smtplib,'SMTP',return_value=smtp):
             dukaan.send_invitation_email('test@example.test','subject','body')

@@ -1,6 +1,6 @@
 # DukaanDesk Project Context
 
-Last audited: 2026-10-12
+Last updated: 2026-10-13 (Phase 2.5 SMTP-only review; no new full audit)
 
 This document is the implementation handoff for future developers and AI assistants. Treat the code and migrations as authoritative if this file later becomes stale.
 
@@ -40,7 +40,7 @@ Microsoft SQL Server / CODManager
   └─ trg_Users_ImmutableIdentity
 ```
 
-There is no JSON API, SPA, background worker, queue, cache, external identity provider, product service, or connector service. Pages are server-rendered. Invitation email uses optional synchronous standard-library SMTP with mandatory verified STARTTLS. Small acceptance-page JavaScript reads and removes the secret URL fragment; shared presentation is in `public/styles.css`.
+There is no JSON API, SPA, background worker, queue, cache, external identity provider, product service, or connector service. Pages are server-rendered. Invitation email uses optional synchronous standard-library SMTP with mandatory verified STARTTLS or implicit TLS (TLS 1.2 minimum). Small acceptance-page JavaScript reads and removes the secret URL fragment; shared presentation is in `public/styles.css`.
 
 ## Source files
 
@@ -59,6 +59,7 @@ There is no JSON API, SPA, background worker, queue, cache, external identity pr
 - `public/invitation_accept.html`: CSRF-protected mailbox verification, authenticated acceptance, and new employee registration.
 - `public/invitation_created.html`: explicit loopback-development-only one-time secret link display.
 - `tests/test_invitations.py`: offline token, transport, development safety, CSRF, and nullable legacy identity tests.
+- `tests/test_smtp.py`: offline SMTP configuration/TLS/failure tests plus mocked route transaction, token/code, and fail-closed checks; no real network or database calls.
 - `1_Schema.sql`: fresh `CODManager` installer. It aborts when the database already exists.
 - `2_Logic.sql`: creates/updates the pending view and a multi-row-safe insert trigger.
 - `3_DataTesting.sql`: idempotent local seed; it does not delete existing rows.
@@ -143,7 +144,11 @@ Creation, acceptance, revocation, and deactivation use organization-level update
 
 Every acceptance requires a separate SMTP-delivered 15-minute verification code, including authenticated existing users: a matching session alone is insufficient because legacy business signup permits unverified emails. Existing-user acceptance also requires a fresh active matching global identity and current authenticating membership. New registration cannot merge with an existing email; user creation (scrypt), active membership, and token consumption commit atomically. Verification resends are limited to once per minute per invitation and invalidate earlier codes. A code is cleared on acceptance/revocation/expiry. The 256-bit code avoids short-OTP brute-force exposure but does not replace account/IP abuse controls.
 
-SMTP delivery is synchronous, mandatory verified STARTTLS, with secrets from the environment and a fixed HTTPS `APP_PUBLIC_URL`. No provider is configured or externally tested locally. Production invitation secrets appear only in delivered mail, never owner pages or application logs. Invitation URLs use fragments; acceptance moves the token into a POST field, clears browser history, and sets no-store/no-referrer. Infrastructure must not log request bodies. A send followed by a failed commit can produce an unusable email; durable outbox/retry remains future work.
+SMTP delivery is synchronous, mandatory verified STARTTLS or implicit TLS, with secrets from the environment and a fixed HTTPS `APP_PUBLIC_URL`. No provider is configured or externally tested locally. Production invitation secrets are delivered by mail, never displayed on owner pages or application logs. Invitation URLs use fragments; acceptance moves the token into a POST field, clears browser history, and sets no-store/no-referrer. Infrastructure must not log request bodies. A send followed by a failed commit or SMTP disconnect can produce an unusable new link/code; durable outbox/retry remains future work.
+
+Phase 2.5 transport configuration: `SMTP_HOST` and single bare ASCII `SMTP_FROM` are required; `SMTP_SECURITY=starttls|ssl` defaults to starttls, with default `SMTP_PORT` 587/465 respectively. Explicit ports must be 1–65535; `SMTP_TIMEOUT` must be 1–60 seconds (default 10, per socket operation). `SMTP_USERNAME` and `SMTP_PASSWORD` must be supplied together, or both omitted for an authorized relay. No OAuth-only authentication, plaintext mode, certificate bypass, or downgrade fallback is implemented. `APP_PUBLIC_URL` is the fixed HTTPS invitation origin; existing session/DB configuration remains necessary. README has exact setup and manual browser checks.
+
+`smtp_configuration` validates before connecting, rejecting invalid values instead of substituting defaults. `smtp_mailbox` restricts sender/recipient to one bare ASCII address; the transport passes explicit envelope sender and one recipient. Both modes use the system trust store, hostname verification, and TLS 1.2 minimum. STARTTLS must succeed before refreshing EHLO/authentication; implicit TLS connects encrypted before EHLO. Failed EHLO aborts before login/send. `EmailDeliveryError` exposes only an allowlisted category; raw provider responses/configuration/message bodies are never logged. Both invitation and verification routes roll back on delivery failure with a generic 503, without changing acceptance rules. UI success means submitted to SMTP, not proven mailbox delivery.
 
 Development-only link display requires `APP_ENV=development`, `DEV_INVITATION_LINKS=true`, and a loopback remote address. Bind to 127.0.0.1; never enable behind a proxy or in shared environments. The link is shown once, not stored raw. No verification code is displayed: absent SMTP means acceptance is blocked for all recipients. SQL tests mock mail delivery while exercising actual SQL transactions; these tests are not proof of real email delivery.
 
@@ -271,6 +276,13 @@ Phase 2.4 SQL verification on 2026-10-12:
 - Mail delivery was mocked while SQL transactions were real. No external mail was sent. SMTP is not configured locally; local development invitation links cannot activate membership without separate delivered mailbox proof. Browser visual QA remains unverified.
 - Original row-set preservation checks cover all six legacy tables, global identities, memberships, role assignments, and any pre-existing invitations. Tests retain new uniquely named synthetic fixtures; no cleanup deletes/resets ran. Final counts: 107 sellers/organizations/ClientUsers, 115 Users (8 employees with NULL legacy links), 136 memberships, 91 buyers, 181 orders, 290 logs, 27 invitations (13 Accepted / 3 Expired / 8 Pending / 3 Revoked). No missing legacy mappings or disabled/untrusted FKs/invitation checks. No CODManager/system database was accessed.
 
+Phase 2.5 focused verification on 2026-10-13:
+
+- Preserved interrupted SMTP edits and unrelated local files; completed strict configuration, STARTTLS/implicit TLS, safe error categories, and focused mocked tests. No database/schema, RBAC policy, invitation lifetime, acceptance, or tenant-model changes.
+- SMTP/invitation tests: **22 passed, 46 subtests passed**. Selected existing CSRF/RBAC/tenant/session tests: **6 passed, 61 subtests passed**, 17 deselected. All passed; commands are in README. No redundant full-suite or SQL run.
+- Covered TLS verification/auth ordering, mode/default/custom port/timeout settings, incomplete credentials, malformed addresses/configuration, explicit delivery envelope, TLS/auth/refusal/timeout/disconnect/EHLO failure, no downgrade, sanitized errors, invitation/code hash-only persistence, rollback without membership activation, consumed/expired invitation denial, resend cooldown, and invalid verification proof. Route database results were fakes, not a real SQL test.
+- Presence-only environment inspection found no SMTP settings or `APP_PUBLIC_URL`. No real SMTP connection/email send, browser delivery check, or database access was performed. Provider credentials and authorized sender/origin configuration remain external prerequisites. Phase 2.4 SQL figures above are historical and were not reverified.
+
 Not verified in the current environment:
 
 - Linux/Codespace ODBC driver installation and SQL connectivity; this verification used the local Windows instance and shared-memory `sqlcmd` transport.
@@ -287,6 +299,8 @@ Not verified in the current environment:
 5. Any real connector work needs signed webhook ingestion, idempotency keys, provider credential encryption, store-level tenant boundaries, retry/dead-letter handling, and reconciliation before it can be called reliable.
 6. Update this file, `README.md`, tests, and `ROADMAP.md` whenever routes, state rules, schema, or verified runtime status changes.
 
-## Phase 2.4 status
+## Phase 2.5 status
 
 Status: global identities, active memberships, six organization-scoped roles, Owner-only role assignment, employee invitations, and membership deactivation are implemented. Employees no longer require a legacy account link; existing links remain immutable. Each organization still has one seller/domain. No unauthenticated self-service membership attachment, reactivation, connector, billing, or super-admin functionality exists. Existing users without any usable active membership need a separately reviewed recovery process before accepting. Configure and verify SMTP before real invitations; durable administrative audits, password-change session invalidation, recovery, general account-email verification, abuse controls, production operations, and independent security review remain priorities.
+
+SMTP configuration and both secure transport modes are implemented and mock-tested. Real provider authentication/inbox delivery remains blocked by missing configuration, not claimed complete. No production readiness is implied.

@@ -1,6 +1,6 @@
 # DukaanDesk Roadmap
 
-Last updated: 2026-10-12
+Last updated: 2026-10-13
 
 ## Product direction
 
@@ -37,13 +37,20 @@ Phase 2.1 added organization IDs; Phase 2.2 added global users, memberships, and
 - Revalidate memberships and user activity/lockout on every protected request and in protected order SQL; provide a minimal CSRF-protected organization selector.
 - Phase 2.3: SQL role assignments and explicit grants, conservative founder backfill, deny-by-default route/query guards, role-aware navigation, roster access, and Owner-only role assignment with last-owner protection.
 - Phase 2.4: hashed single-use invitations, separate SMTP mailbox verification, secure employee registration without legacy seller accounts, authenticated existing-user acceptance, non-Owner invitation roles, revocation/expiry, and tenant-scoped membership deactivation with last-Owner protection.
+- Phase 2.5: strict environment-based SMTP validation, verified STARTTLS/implicit TLS, explicit single-recipient envelope, bounded socket timeout, sanitized error categories, and mocked transport/route rollback tests. No new dependencies, migrations, or invitation authorization changes.
 
 The original hardening and Phase 2.1/2.2 work have been verified against the disposable SQL Server database described below. This does not establish production readiness.
 
-## Verification checkpoint — 2026-10-12
+## SMTP checkpoint — 2026-10-13
 
-- Current offline verification: 29 tests pass with 77 subtests; eighteen guarded SQL tests require explicit opt-in.
-- Current SQL verification: the full suite reports 47 passed and 101 subtests against confirmed disposable `DukaanDesk_Test` on `localhost\MSSQLSERVER01`. One obsolete offline query-shape assertion initially failed and was corrected; no SQL failures occurred.
+- SMTP/invitation focused tests: **22 passed, 46 subtests passed**. Existing focused CSRF/RBAC/tenant/session regressions: **6 passed, 61 subtests passed**, 17 deselected. No failed tests. Full and SQL suites were not rerun; no databases were accessed or modified.
+- Strict configuration and STARTTLS/implicit TLS transport paths are mock-verified, including certificate enforcement, TLS-before-auth, refusal/timeouts, rollback, and secret-free error logs. Token expiry, single-use acceptance, mailbox proof, roles, and tenant scoping remain unchanged.
+- SMTP configuration and `APP_PUBLIC_URL` are absent in the current process. Real provider authentication, inbox delivery, and the README browser checklist remain blocked/unverified. Add actual provider configuration outside Git; never claim mocked submission proves real delivery.
+
+## Historical full verification checkpoint — 2026-10-12
+
+- Phase 2.4 offline verification: 29 tests pass with 77 subtests; eighteen guarded SQL tests require explicit opt-in.
+- Phase 2.4 SQL verification: the full suite reports 47 passed and 101 subtests against confirmed disposable `DukaanDesk_Test` on `localhost\MSSQLSERVER01`. One obsolete offline query-shape assertion initially failed and was corrected; no SQL failures occurred.
 - Signup, password hashing, hashed login, legacy-plaintext upgrade, lockout, order creation, confirmation/cancellation, delivery, tenant isolation, exact message logs, summaries, and concurrent seller-relative numbering were exercised against real SQL Server.
 - Read-only migration preflight found no invalid or cross-seller rows. The organization migration backfilled all 18 existing sellers without changing legacy row fingerprints, and a second run inserted zero rows. Seed and reset scripts were not run; `CODManager` remained absent.
 - **Phase 2.1 organization foundation is complete.** The additive migration preserved the original synthetic dataset, backfilled every seller, and passed idempotence, immutability, mapping, and cross-organization tests.

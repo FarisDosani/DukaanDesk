@@ -290,7 +290,7 @@ Workflow:
 4. Existing users sign in with the matching global email; fresh SQL identity/activity checks plus the code authorize acceptance. New users provide a unique username and matching 10–128-character password; hashed user creation, active membership, and invitation consumption commit together. No legacy seller/account is created for employees, and no identity merging occurs.
 5. Accepted/revoked/expired tokens cannot be reused. Expiry uses SQL UTC time, is displayed immediately, and is persisted on attempted use, revocation, or replacement. No expiry worker is required. The inviting Owner must still be authorized when the token is used. Owner can deactivate membership, but cannot remove the last active unlocked Owner. Existing sessions lose access on their next protected request.
 
-Production-style delivery uses Python's standard-library SMTP with mandatory certificate-verified STARTTLS (no new package). Configure `SMTP_HOST`, `SMTP_PORT` (default 587), `SMTP_FROM`, optional `SMTP_USERNAME`/`SMTP_PASSWORD`, and `APP_PUBLIC_URL` as a fixed HTTPS origin such as `https://app.example.com`. Configure secrets outside Git. Keep `DEV_INVITATION_LINKS` unset in shared environments. Mail errors fail closed; message bodies, tokens, and SMTP errors are not logged by the application. Delivery is synchronous: a message may arrive before a subsequent database commit fails, in which case the link/code is unusable. A durable outbox is future work.
+Delivery uses Python's standard-library SMTP with mandatory certificate-verified STARTTLS or implicit TLS (no new package). Both modes require TLS 1.2 or newer and hostname verification; there is no plaintext/downgrade option. See Phase 2.5 configuration below. Keep `DEV_INVITATION_LINKS` unset in shared environments. Delivery is synchronous: a message may arrive before a subsequent database commit or SMTP disconnect fails, in which case the new link/code is unusable. A durable outbox is future work.
 
 Local development without an invitation-email transport:
 
@@ -314,7 +314,58 @@ sqlcmd -S 'lpc:localhost\MSSQLSERVER01' -E -N -C -d DukaanDesk_Test -b -i 9_Orga
 
 Stop if the target or ownership is uncertain, duplicate mappings exist, or the expected FK is disabled/untrusted. No production migration is authorized by these instructions.
 
-### Latest verification — Phase 2.4 (2026-10-12)
+### Phase 2.5 — SMTP setup and verification
+
+Exact environment variables (read at send time; restart after changing the launching shell's environment):
+
+- `SMTP_HOST`: required hostname/IP, without a URL scheme, credentials, or path.
+- `SMTP_FROM`: required provider-authorized, bare ASCII email address; display names/address lists are not supported. Recipients must also be single bare ASCII mailboxes.
+- `SMTP_SECURITY`: `starttls` (default) or `ssl` (implicit TLS).
+- `SMTP_PORT`: integer 1–65535; default 587 for `starttls`, 465 for `ssl`. Follow your provider's TLS/port pairing.
+- `SMTP_TIMEOUT`: integer 1–60 seconds, default 10; applies to socket operations, not the entire delivery transaction.
+- `SMTP_USERNAME` and `SMTP_PASSWORD`: provide both for authentication, or omit both only for an explicitly authorized trusted relay. Use a provider-issued SMTP credential/app password where applicable; do not put credentials in Git, URLs, screenshots, or logs. OAuth-only SMTP authentication is not implemented.
+- `APP_PUBLIC_URL`: required for emailed invitation links; a fixed HTTPS origin, e.g. `https://app.example.com`, without a path, query, fragment, or embedded credentials. It is never taken from an incoming Host header.
+
+Missing/invalid configuration fails before SMTP connection; malformed port/timeout values are rejected rather than silently replaced. Authentication occurs only after verified TLS and successful EHLO. A refused sender/recipient/message, failed certificate, unsupported STARTTLS, timeout, or connection/authentication failure returns a safe HTTP 503 and rolls back the invitation/code transaction. No membership activates through a send failure. Logs contain only fixed failure categories (`configuration`, `authentication`, `tls-or-capability`, `rejected`, `timeout`, `unavailable`, `message-configuration`), never SMTP server responses, addresses, credentials, or message bodies. Never enable infrastructure request-body logging for invitation endpoints.
+
+Example PowerShell setup, using your provider settings and an already-authorized HTTPS app origin:
+
+```powershell
+$env:SMTP_HOST = 'smtp.your-provider.example'
+$env:SMTP_FROM = 'verified-sender@your-domain.example'
+$env:SMTP_SECURITY = 'starttls'
+$env:SMTP_PORT = '587'
+$env:SMTP_TIMEOUT = '10'
+$env:APP_PUBLIC_URL = 'https://your-app.example'
+$smtpCredential = Get-Credential -Message 'Enter your provider SMTP credentials'
+$env:SMTP_USERNAME = $smtpCredential.UserName
+$env:SMTP_PASSWORD = $smtpCredential.GetNetworkCredential().Password
+$env:DEV_INVITATION_LINKS = 'false'
+# Keep the existing DB settings and stable SESSION_SECRET. HTTPS needs:
+$env:SESSION_COOKIE_SECURE = 'true'
+python -B -c "import app; app.smtp_configuration(); print('SMTP configuration valid; no network delivery tested')"
+python -B app.py
+```
+
+For implicit TLS, set `SMTP_SECURITY=ssl` and `SMTP_PORT=465` (or your provider's explicit port). The example does not provision HTTPS or deploy the app. Configuration validation proves neither provider authentication nor inbox delivery. Environment variables hold secrets in process memory; use the deployment secret manager for a shared environment.
+
+Manual browser verification — not yet performed:
+
+1. Use an approved disposable test database with migration 9 already installed, a configured mail provider, and inboxes you control. Do not migrate/reset an existing database for this check. Open the configured HTTPS app as an Owner.
+2. Invite a test recipient to a non-Owner role from Members. Check the actual inbox/spam folder; the UI saying “submitted” means SMTP server acceptance, not confirmed inbox delivery. Confirm the invitation URL uses the configured origin and the page removes its fragment.
+3. In a separate browser profile, open the link and request verification. Confirm a second email arrives at the invited mailbox; the application must not display the code. New recipients register using that code; existing recipients sign in with the matching email, reopen the link, and enter the code to accept.
+4. Confirm the expected organization/role appears. Reopen the consumed invitation: it must not activate another membership. A different signed-in email or missing/wrong code must not accept.
+5. Use separate fresh test invitations to check Owner revocation, resend cooldown (60 seconds), replacement-code invalidation, and natural expiry (15-minute code / 48-hour invitation), without editing database timestamps. Non-Owners must not invite or revoke.
+6. In an isolated test process, an unavailable SMTP host or rejected credentials must produce a safe 503, no new committed invitation/code, and no activated membership. Never paste credentials or codes into bug reports. Restore the test process configuration afterward.
+
+### Latest verification — Phase 2.5 (2026-10-13)
+
+- `python -B -m pytest tests/test_smtp.py tests/test_invitations.py -q -p no:cacheprovider`: **22 passed, 46 subtests passed**.
+- Focused existing CSRF/RBAC/tenant/session regressions: **6 passed, 61 subtests passed**, 17 unrelated tests deselected. Command: `python -B -m pytest tests/test_app.py -q -p no:cacheprovider -k "post_without_csrf or each_role_permission or role_change_revalidated or forged_global or membership_revoked or switch_requires"`.
+- All focused tests passed. SMTP and route database connections were mocked: tests cover both TLS modes/certificate settings, strict configuration, explicit recipient envelope, TLS-before-auth ordering, refusal/auth/timeout/disconnect failures, sanitized logging, hash-only persistence, rollback, consumed/expired tokens, cooldown, and missing/wrong-proof denial. Full suites and SQL integration were deliberately not rerun. No database was accessed or modified; no migration or new dependency was needed.
+- All SMTP environment variables and `APP_PUBLIC_URL` were absent in the inspected process (only presence was checked). **Real email delivery, provider authentication, and manual browser verification remain untested.** Existing Phase 2.4 SQL results below are historical, not a new SQL verification claim.
+
+### Historical verification — Phase 2.4 (2026-10-12)
 
 - Offline suite: **29 passed, 77 subtests passed**. Final SQL-enabled full suite: **47 passed, 101 subtests passed** (29 offline + 18 SQL tests). `pip check` and `git diff --check` passed. An initial offline failure was the old legacy-only SQL-shape assertion; it was updated to verify the backward-compatible global/legacy lookup. No SQL test failures occurred.
 - Read-only preflight confirmed `DukaanDesk_Test`, 60 users, 67 memberships, trusted legacy FKs, and no invitations table. Migration 9 was applied there only and rerun idempotently; original row values were compared in memory and preserved. Earlier migrations 7/8 remain compatible.

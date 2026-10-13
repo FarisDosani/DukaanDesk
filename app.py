@@ -6,6 +6,8 @@ import secrets
 import smtplib
 import ssl
 from email.message import EmailMessage
+from email.headerregistry import Address
+from email.errors import HeaderParseError
 from urllib.parse import urlsplit
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -1426,19 +1428,83 @@ def development_invitation_delivery() -> bool:
             and request.remote_addr in {'127.0.0.1', '::1'})
 
 
+class EmailDeliveryError(RuntimeError):
+    """Only fixed, non-sensitive categories may cross the transport boundary."""
+    def __init__(self, category):
+        safe_categories = {'configuration', 'authentication', 'tls-or-capability',
+                           'rejected', 'timeout', 'unavailable', 'message-configuration'}
+        super().__init__(category if category in safe_categories else 'unavailable')
+
+
+def smtp_mailbox(value: str) -> str:
+    # Exactly one bare ASCII mailbox, not a display name, address list, or header.
+    if not value or not value.isascii() or any(ord(char)<33 or ord(char)==127 for char in value):
+        raise ValueError('Invalid mailbox')
+    address = Address(addr_spec=value)
+    if not address.username or not address.domain or address.addr_spec != value:
+        raise ValueError('Invalid mailbox')
+    return value
+
+
+def smtp_configuration() -> dict:
+    """Validate before connecting; never return configuration in HTTP/logs."""
+    try:
+        host = os.getenv('SMTP_HOST', '').strip()
+        sender = smtp_mailbox(os.getenv('SMTP_FROM', '').strip())
+        security = os.getenv('SMTP_SECURITY', 'starttls').strip().lower()
+        if (not host or any(char.isspace() or ord(char)<32 or ord(char)==127 or char in '/\\@' for char in host)
+            or security not in {'starttls', 'ssl'}):
+            raise ValueError('Invalid SMTP host or security mode')
+        port = int(os.getenv('SMTP_PORT', '465' if security == 'ssl' else '587'))
+        timeout = int(os.getenv('SMTP_TIMEOUT', '10'))
+        username, password = os.getenv('SMTP_USERNAME', ''), os.getenv('SMTP_PASSWORD', '')
+        if not 1<=port<=65535 or not 1<=timeout<=60 or bool(username) != bool(password):
+            raise ValueError('Invalid SMTP port, timeout, or credentials')
+        return dict(host=host, sender=sender, security=security, port=port,
+                    timeout=timeout, username=username, password=password)
+    except (ValueError, IndexError, HeaderParseError):
+        raise EmailDeliveryError('configuration') from None
+
+
 def send_invitation_email(recipient: str, subject: str, body: str):
-    """SMTP with mandatory verified STARTTLS. Never log message bodies or errors."""
-    host, sender = os.getenv('SMTP_HOST'), os.getenv('SMTP_FROM')
-    if not host or not sender:
-        raise RuntimeError('Email delivery is not configured')
-    message = EmailMessage()
-    message['From'], message['To'], message['Subject'] = sender, recipient, subject
-    message.set_content(body)
-    with smtplib.SMTP(host, env_int('SMTP_PORT', 587, 1, 65535), timeout=10) as smtp:
-        smtp.starttls(context=ssl.create_default_context())
-        if os.getenv('SMTP_USERNAME'):
-            smtp.login(os.environ['SMTP_USERNAME'], os.getenv('SMTP_PASSWORD', ''))
-        smtp.send_message(message)
+    """Verified TLS only, no downgrade/retry; sanitize all transport errors."""
+    config = smtp_configuration()
+    try:
+        recipient = smtp_mailbox(recipient)
+        message = EmailMessage()
+        message['From'], message['To'], message['Subject'] = config['sender'], recipient, subject
+        message.set_content(body)
+        context = ssl.create_default_context()
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        if config['security'] == 'ssl':
+            transport = smtplib.SMTP_SSL(config['host'], config['port'], timeout=config['timeout'], context=context)
+        else:
+            transport = smtplib.SMTP(config['host'], config['port'], timeout=config['timeout'])
+        with transport as smtp:
+            if config['security'] == 'starttls':
+                smtp.starttls(context=context)  # smtplib performs initial EHLO.
+            code, _ = smtp.ehlo()  # Refresh capabilities only after TLS is established.
+            if code != 250:
+                raise EmailDeliveryError('unavailable')
+            if config['username']:
+                smtp.login(config['username'], config['password'])
+            refused = smtp.send_message(message, from_addr=config['sender'], to_addrs=[recipient])
+            if refused:
+                raise EmailDeliveryError('rejected')
+    except EmailDeliveryError:
+        raise
+    except smtplib.SMTPAuthenticationError:
+        raise EmailDeliveryError('authentication') from None
+    except (ssl.SSLError, smtplib.SMTPNotSupportedError):
+        raise EmailDeliveryError('tls-or-capability') from None
+    except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError):
+        raise EmailDeliveryError('rejected') from None
+    except TimeoutError:
+        raise EmailDeliveryError('timeout') from None
+    except (OSError, smtplib.SMTPException):
+        raise EmailDeliveryError('unavailable') from None
+    except (ValueError, IndexError, HeaderParseError):
+        raise EmailDeliveryError('message-configuration') from None
 
 
 def invitation_link(token: str) -> str:
@@ -1497,16 +1563,21 @@ def create_invitation():
         else:
             send_invitation_email(email, 'Your DukaanDesk employee invitation',
                 'You were invited to an organization as ' + role + '. This invitation expires in 48 hours.\n'
-                + invitation_link(token) + '\nSign in with the matching account, or verify your mailbox to register.')
+                + invitation_link(token) + '\nAll recipients must request a separate email verification code. '
+                'Existing users must also sign in with the matching account; new users can register after verification.')
             link = None
         conn.commit()
         if link:
             return render_template('invitation_created.html', link=link), 201
-        flash('Invitation sent. It expires in 48 hours.', 'success')
+        flash('Invitation submitted to the mail server. Check the recipient inbox/spam folder. It expires in 48 hours.', 'success')
         return redirect(url_for('organization_members'))
     except pyodbc.IntegrityError:
         conn.rollback()
         abort(409, description='An invitation or membership already exists.')
+    except EmailDeliveryError as err:
+        conn.rollback()
+        app.logger.warning('Invitation email failed (%s); transaction rolled back.', str(err))
+        abort(503, description='Email could not be submitted securely. No invitation was saved. Contact your administrator.')
     except (pyodbc.Error, OSError, smtplib.SMTPException, RuntimeError, ValueError):
         conn.rollback()
         app.logger.error('Invitation creation or delivery failed; no invitation was committed.')
@@ -1620,7 +1691,7 @@ def accept_invitation():
                 WHERE InvitationID=?""", (invitation_digest(verification), invite.InvitationID))
             conn.commit()
             return render_template('invitation_accept.html', token=token,
-                                   notice='Verification code sent to the invited mailbox. It expires in 15 minutes.')
+                                   notice='Verification email submitted. Check the invited inbox/spam folder. The code expires in 15 minutes.')
         verification = request.form.get('verification', '')
         if (not invite.VerificationValid or not invite.VerificationHash
             or not hmac.compare_digest(invite.VerificationHash, invitation_digest(verification))):
@@ -1659,10 +1730,14 @@ def accept_invitation():
     except pyodbc.IntegrityError:
         conn.rollback()
         abort(409, description='An account or membership already exists; nothing was merged.')
+    except EmailDeliveryError as err:
+        conn.rollback()
+        app.logger.warning('Invitation verification email failed (%s); transaction rolled back.', str(err))
+        abort(503, description='Verification email could not be submitted securely. No membership was activated. Contact your administrator.')
     except (pyodbc.Error, OSError, smtplib.SMTPException, RuntimeError, ValueError):
         conn.rollback()
         app.logger.error('Invitation acceptance or verification delivery failed.')
-        abort(503, description='Email or database service unavailable. New registration requires email verification.')
+        abort(503, description='Email or database service unavailable. Acceptance requires separate email verification.')
     finally:
         conn.close()
 
